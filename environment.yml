@@ -1,0 +1,15 @@
+name: pt_designer
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - pysam
+  - pandas
+  - samtools
+  - htslib
+  - bedops
+  - bedtools
+  - openjdk=8
+  - lightgbm==3.3.5
+  - rs3
