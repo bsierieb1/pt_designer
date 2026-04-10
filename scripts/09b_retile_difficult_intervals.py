@@ -146,7 +146,20 @@ def block_constraints_ok(tiles, idxs, max_tile, min_tile, min_overlap):
         if L < min_tile or L > max_tile:
             return False
     for i in range(len(tiles) - 1):
-        ov = int(tiles.iloc[i]['tile_end_1based']) - int(tiles.iloc[i + 1]['tile_start_1based']) + 1
+        left_start = int(tiles.iloc[i]['tile_start_1based'])
+        left_end = int(tiles.iloc[i]['tile_end_1based'])
+        right_start = int(tiles.iloc[i + 1]['tile_start_1based'])
+        right_end = int(tiles.iloc[i + 1]['tile_end_1based'])
+
+        # Adjacent tiles must progress monotonically across the locus.
+        # This forbids pathological containment geometries such as tile i+1
+        # being fully nested inside tile i.
+        if not (left_start < right_start):
+            return False
+        if not (left_end < right_end):
+            return False
+
+        ov = left_end - right_start + 1
         if ov < min_overlap:
             return False
     return True

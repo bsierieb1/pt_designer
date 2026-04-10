@@ -90,11 +90,6 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Step size for internal boundary optimization. Default: 100",
     )
-    parser.add_argument(
-        "--force-single-tile",
-        action="store_true",
-        help="If set, emit a single tile spanning the full locus regardless of target tile size.",
-    )
 
     return parser.parse_args()
 
@@ -150,7 +145,6 @@ def build_initial_tiles(
     locus_end_1: int,
     target_tile_size: int,
     target_overlap_size: int,
-    force_single_tile: bool = False,
 ) -> List[Tile]:
     """
     Build a first-pass overlapping tile scaffold with similarly sized tiles.
@@ -165,7 +159,7 @@ def build_initial_tiles(
         raise ValueError("target_overlap_size must be smaller than target_tile_size")
 
     locus_len = locus_end_1 - locus_start_1 + 1
-    if force_single_tile or locus_len <= target_tile_size:
+    if locus_len <= target_tile_size:
         return [Tile(1, chrom, locus_start_1, locus_end_1)]
 
     n_tiles = max(2, math.ceil(locus_len / target_tile_size))
@@ -278,6 +272,29 @@ def locus_fully_covered(tiles: List[Tile], locus_start_1: int, locus_end_1: int)
     return True
 
 
+def tiles_have_valid_geometry(tiles: List[Tile]) -> bool:
+    """
+    Enforce sensible left-to-right tile ordering.
+
+    Adjacent tiles may overlap, but they must not be identical or nested. In
+    practice that means both starts and ends must increase monotonically across
+    the ordered tile list.
+    """
+    if not tiles:
+        return False
+
+    for i in range(len(tiles) - 1):
+        left = tiles[i]
+        right = tiles[i + 1]
+
+        if not (left.start_1based < right.start_1based):
+            return False
+        if not (left.end_1based < right.end_1based):
+            return False
+
+    return True
+
+
 def score_overlap_set(overlaps_df: pd.DataFrame) -> Tuple[int, int, int, float]:
     """
     Lexicographic overlap objective:
@@ -373,6 +390,8 @@ def optimize_internal_boundaries(
                     continue
                 if not locus_fully_covered(candidate_tiles, locus_start_1, locus_end_1):
                     continue
+                if not tiles_have_valid_geometry(candidate_tiles):
+                    continue
 
                 candidate_overlaps = compute_overlaps(candidate_tiles, snps_df)
                 candidate_score = score_overlap_set(candidate_overlaps)
@@ -441,7 +460,6 @@ def main() -> int:
         locus_end_1=locus_end_1,
         target_tile_size=args.target_tile_size,
         target_overlap_size=args.target_overlap_size,
-        force_single_tile=args.force_single_tile,
     )
 
     initial_tiles_df = pd.DataFrame([tile_to_dict(t) for t in initial_tiles])
