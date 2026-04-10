@@ -24,6 +24,12 @@ def main() -> int:
     ap.add_argument("--scripts-dir", default="scripts", help="Directory containing pipeline scripts")
     ap.add_argument("--refs-dir", default="refs", help="Directory containing reference files")
     ap.add_argument("--tools-dir", default="tools", help="Directory containing helper tools")
+    ap.add_argument("--target-tile-size", required=True, type=int, help="Desired tile size in bp for Step 2")
+    ap.add_argument("--min-tile-size", required=True, type=int, help="Minimum allowed tile size in bp for Step 2")
+    ap.add_argument("--max-tile-size", required=True, type=int, help="Maximum allowed tile size in bp for Step 2")
+    ap.add_argument("--target-overlap-size", default=2000, type=int, help="Desired overlap size in bp for Step 2")
+    ap.add_argument("--boundary-shift-max", default=1000, type=int, help="Maximum internal boundary shift in bp for Step 2")
+    ap.add_argument("--boundary-shift-step", default=100, type=int, help="Boundary shift step size in bp for Step 2")
     args = ap.parse_args()
 
     py = args.python
@@ -57,12 +63,12 @@ def main() -> int:
         "--locus-json", out("01_locus_annotation", "locus.json"),
         "--common-snps-bed", out("01_locus_annotation", "common_snps.bed"),
         "--outdir", out("02_tiles"),
-        "--target-tile-size", "10000",
-        "--target-overlap-size", "2000",
-        "--min-tile-size", "5000",
-        "--max-tile-size", "12000",
-        "--boundary-shift-max", "1000",
-        "--boundary-shift-step", "100",
+        "--target-tile-size", str(args.target_tile_size),
+        "--target-overlap-size", str(args.target_overlap_size),
+        "--min-tile-size", str(args.min_tile_size),
+        "--max-tile-size", str(args.max_tile_size),
+        "--boundary-shift-max", str(args.boundary_shift_max),
+        "--boundary-shift-step", str(args.boundary_shift_step),
     ])
 
     # 03
