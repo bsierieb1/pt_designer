@@ -100,13 +100,22 @@ def load_candidates(path: Path) -> pd.DataFrame:
 
 
 def load_bed(path: Optional[Path], source_name: str) -> pd.DataFrame:
+    empty_cols = ["chrom", "start_0based", "end_0based", "name", "score", "strand"]
+
     if path is None:
-        return pd.DataFrame(columns=["chrom", "start_0based", "end_0based", "name", "score", "strand"])
+        return pd.DataFrame(columns=empty_cols)
 
     if not path.exists():
         raise FileNotFoundError(f"{source_name} BED not found: {path}")
 
-    df = pd.read_csv(path, sep="\t", header=None, comment="#")
+    if path.stat().st_size == 0:
+        return pd.DataFrame(columns=empty_cols)
+
+    try:
+        df = pd.read_csv(path, sep="	", header=None, comment="#")
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=empty_cols)
+
     if df.shape[1] < 3:
         raise ValueError(f"{source_name} BED must have at least 3 columns")
 
