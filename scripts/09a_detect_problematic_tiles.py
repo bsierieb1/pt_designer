@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse, json
+from pandas.errors import EmptyDataError
 from pathlib import Path
 import pandas as pd
 
@@ -75,7 +76,14 @@ def main():
     outdir = Path(a.outdir); outdir.mkdir(parents=True, exist_ok=True)
     tiles = pd.read_csv(a.tile_plan_tsv, sep='\t').copy()
     pairs = pd.read_csv(a.selected_pairs_tsv, sep='\t').copy()
-    overlaps = pd.read_csv(a.tile_overlaps_tsv, sep='\t') if a.tile_overlaps_tsv else None
+    overlaps = None
+    if a.tile_overlaps_tsv:
+        overlap_path = Path(a.tile_overlaps_tsv)
+        if overlap_path.exists() and overlap_path.stat().st_size > 0:
+            try:
+                overlaps = pd.read_csv(overlap_path, sep='\t')
+            except EmptyDataError:
+                overlaps = None
     tid = choose_col(tiles, ['tile_id','tile_index'])
     scol = choose_col(tiles, ['tile_start_1based','start_1based','tile_start','start'])
     ecol = choose_col(tiles, ['tile_end_1based','end_1based','tile_end','end'])
