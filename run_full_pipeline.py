@@ -30,6 +30,7 @@ def main() -> int:
     ap.add_argument("--target-overlap-size", default=2000, type=int, help="Desired overlap size in bp for Step 2")
     ap.add_argument("--boundary-shift-max", default=1000, type=int, help="Maximum internal boundary shift in bp for Step 2")
     ap.add_argument("--boundary-shift-step", default=100, type=int, help="Boundary shift step size in bp for Step 2")
+    ap.add_argument("--force-single-tile", action="store_true", help="Force Step 2 to emit a single full-locus tile.")
     args = ap.parse_args()
 
     py = args.python
@@ -58,7 +59,7 @@ def main() -> int:
     ])
 
     # 02
-    run([
+    step02_cmd = [
         py, script("02_make_tiles.py"),
         "--locus-json", out("01_locus_annotation", "locus.json"),
         "--common-snps-bed", out("01_locus_annotation", "common_snps.bed"),
@@ -69,7 +70,10 @@ def main() -> int:
         "--max-tile-size", str(args.max_tile_size),
         "--boundary-shift-max", str(args.boundary_shift_max),
         "--boundary-shift-step", str(args.boundary_shift_step),
-    ])
+    ]
+    if args.force_single_tile:
+        step02_cmd.append("--force-single-tile")
+    run(step02_cmd)
 
     # 03
     run([

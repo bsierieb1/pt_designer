@@ -90,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Step size for internal boundary optimization. Default: 100",
     )
+    parser.add_argument(
+        "--force-single-tile",
+        action="store_true",
+        help="If set, emit a single tile spanning the full locus regardless of target tile size.",
+    )
 
     return parser.parse_args()
 
@@ -145,6 +150,7 @@ def build_initial_tiles(
     locus_end_1: int,
     target_tile_size: int,
     target_overlap_size: int,
+    force_single_tile: bool = False,
 ) -> List[Tile]:
     """
     Build a first-pass overlapping tile scaffold with similarly sized tiles.
@@ -159,7 +165,7 @@ def build_initial_tiles(
         raise ValueError("target_overlap_size must be smaller than target_tile_size")
 
     locus_len = locus_end_1 - locus_start_1 + 1
-    if locus_len <= target_tile_size:
+    if force_single_tile or locus_len <= target_tile_size:
         return [Tile(1, chrom, locus_start_1, locus_end_1)]
 
     n_tiles = max(2, math.ceil(locus_len / target_tile_size))
@@ -435,6 +441,7 @@ def main() -> int:
         locus_end_1=locus_end_1,
         target_tile_size=args.target_tile_size,
         target_overlap_size=args.target_overlap_size,
+        force_single_tile=args.force_single_tile,
     )
 
     initial_tiles_df = pd.DataFrame([tile_to_dict(t) for t in initial_tiles])
