@@ -7,9 +7,9 @@ import pandas as pd
 
 LOCAL = {
     'no_selected_pair','poor_offtarget_options','poor_ontarget_options','guides_far_from_boundaries',
-    'guide_overlaps_common_snp','guide_overlaps_repeat','guide_overlaps_segdup'
+    'guide_overlaps_common_snp'
 }
-LONG = {'no_selected_pair','poor_offtarget_options','guide_overlaps_repeat','guide_overlaps_segdup','guide_has_exact_in_locus_offtarget'}
+LONG = {'no_selected_pair','poor_offtarget_options','guide_has_exact_in_locus_offtarget'}
 
 def parse_args():
     p = argparse.ArgumentParser(description='Detect problematic tiles and group them into redesign blocks.')
@@ -130,15 +130,13 @@ def main():
             if min_off < a.min_offtarget_score: reasons.append('poor_offtarget_options')
             if min_on < a.min_ontarget_score: reasons.append('poor_ontarget_options')
             if int(chosen.get('pair_total_common_snp_overlaps', 0)) > 0: reasons.append('guide_overlaps_common_snp')
-            if int(chosen.get('pair_total_repeat_overlaps', 0)) > 0: reasons.append('guide_overlaps_repeat')
-            if int(chosen.get('pair_total_segdup_overlaps', 0)) > 0: reasons.append('guide_overlaps_segdup')
             if int(chosen.get('pair_total_low_complexity_flags', 0)) > 0: reasons.append('guide_low_complexity_warning')
             if int(chosen.get('pair_total_homopolymer_flags', 0)) > 0: reasons.append('guide_homopolymer_warning')
             if bad_dist > 2 * a.max_boundary_distance_bp: reasons.append('guides_far_from_boundaries')
             if safe_bool(chosen.get('pair_has_exact_in_locus_offtarget', False)): reasons.append('guide_has_exact_in_locus_offtarget')
             if reasons:
                 severity = 'warning'
-                if any(r in reasons for r in ['poor_offtarget_options','guide_overlaps_repeat','guide_overlaps_segdup','guide_overlaps_common_snp','guides_far_from_boundaries','guide_has_exact_in_locus_offtarget']):
+                if any(r in reasons for r in ['poor_offtarget_options','guide_overlaps_common_snp','guides_far_from_boundaries','guide_has_exact_in_locus_offtarget']):
                     severity = 'hard'
         if frag > a.max_fragment_length_bp: reasons.append('fragment_too_long'); severity = 'hard'
         if frag < a.min_fragment_length_bp: reasons.append('fragment_too_short'); severity = 'hard'

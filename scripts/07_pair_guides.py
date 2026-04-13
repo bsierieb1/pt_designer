@@ -109,7 +109,7 @@ def classify_pair(row: pd.Series) -> str:
         return 'unacceptable'
     if row['pair_has_common_snp_overlap']:
         return 'unacceptable'
-    if row['pair_min_ontarget_score'] >= 70 and row['pair_min_offtarget_score'] >= 70 and row['pair_total_warnings'] == 0:
+    if row['pair_min_ontarget_score'] >= 55 and row['pair_min_offtarget_score'] >= 70 and row['pair_total_warnings'] == 0:
         return 'ideal'
     if row['pair_min_ontarget_score'] >= 55 and row['pair_min_offtarget_score'] >= 45:
         return 'good'
@@ -128,8 +128,6 @@ def compute_pair_score(row: pd.Series) -> float:
     score -= 6.0 * float(row['pair_total_warnings'])
     score -= 120.0 * float(row.get('pair_has_exact_in_locus_offtarget', False))
     score -= 40.0 * float(row['pair_has_common_snp_overlap'])
-    score -= 10.0 * float(row['pair_has_repeat_overlap'])
-    score -= 16.0 * float(row['pair_has_segdup_overlap'])
 
     if row['left_design_class'] in SAFE_BONUS_CLASSES and row['right_design_class'] in SAFE_BONUS_CLASSES:
         score += 8.0

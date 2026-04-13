@@ -7,30 +7,30 @@ import json
 import math
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import pandas as pd
-import pysam
 
 
 LOCUS_RE = re.compile(r"^(chr[\w]+):(\d+)-(\d+)$")
+UCSC_API = "https://api.genome.ucsc.edu"
+ENSEMBL_API = "https://rest.ensembl.org"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Normalize and annotate a requested hg38 locus."
+        description="Normalize and annotate a requested hg38 locus using UCSC/Ensembl remote data sources."
     )
     parser.add_argument(
         "--locus",
         required=True,
         help="Genomic locus in format chr:start-end, e.g. chr7:117120000-117310000",
-    )
-    parser.add_argument(
-        "--fasta",
-        required=True,
-        help="Path to hg38 FASTA file (indexed with .fai).",
     )
     parser.add_argument(
         "--outdir",
@@ -54,37 +54,26 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Sliding window step for GC/complexity metrics. Default: 100",
     )
-
-    # Optional tabix-indexed annotation files
     parser.add_argument(
-        "--common-snps",
-        default=None,
-        help="Optional bgzip+tabix indexed common SNP file (VCF.gz or BED.gz).",
+        "--ucsc-snp-track",
+        default="snp151Common",
+        help="UCSC common-SNP track to query. Default: snp151Common",
     )
     parser.add_argument(
-        "--repeats",
-        default=None,
-        help="Optional bgzip+tabix indexed repeats BED.gz.",
+        "--species",
+        default="human",
+        help="Ensembl species name for gene annotation. Default: human",
     )
     parser.add_argument(
-        "--segdups",
-        default=None,
-        help="Optional bgzip+tabix indexed segmental duplications BED.gz.",
+        "--request-sleep-seconds",
+        type=float,
+        default=1.0,
+        help="Sleep between remote API requests to be gentle on UCSC/Ensembl. Default: 1.0",
     )
-    parser.add_argument(
-        "--genes",
-        default=None,
-        help="Optional bgzip+tabix indexed genes BED.gz or GFF/GTF.gz.",
-    )
-
     return parser.parse_args()
 
 
 def parse_locus(locus: str) -> Tuple[str, int, int]:
-    """
-    Parse locus in 1-based inclusive format: chr:start-end
-    Returns: chrom, start_1based, end_1based
-    """
     m = LOCUS_RE.match(locus.replace(",", ""))
     if not m:
         raise ValueError(
@@ -103,40 +92,62 @@ def parse_locus(locus: str) -> Tuple[str, int, int]:
     return chrom, start, end
 
 
-def ensure_fasta_index(fasta_path: Path) -> None:
-    fai = fasta_path.with_suffix(fasta_path.suffix + ".fai")
-    if not fai.exists():
-        print(f"[INFO] FASTA index not found. Creating {fai.name}", file=sys.stderr)
-        pysam.faidx(str(fasta_path))
-
-
-def validate_chromosome_in_fasta(fasta_path: Path, chrom: str) -> int:
-    fasta = pysam.FastaFile(str(fasta_path))
+def _http_get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 60) -> dict:
+    request = Request(url, headers={"User-Agent": "PacBio-PureTarget-Prototype/1.0", **(headers or {})})
     try:
-        refs = fasta.references
-        lengths = fasta.lengths
-        if chrom not in refs:
-            raise ValueError(
-                f"Chromosome '{chrom}' not found in FASTA. Available refs include: "
-                f"{', '.join(refs[:10])}{' ...' if len(refs) > 10 else ''}"
-            )
-        chrom_len = lengths[refs.index(chrom)]
-        return chrom_len
-    finally:
-        fasta.close()
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code} for {url}\n{body}") from e
+    except URLError as e:
+        raise RuntimeError(f"Request failed for {url}: {e}") from e
 
 
-def fetch_sequence(fasta_path: Path, chrom: str, start_1: int, end_1: int) -> str:
-    """
-    Input locus is 1-based inclusive.
-    pysam fetch uses 0-based half-open.
-    """
-    fasta = pysam.FastaFile(str(fasta_path))
+def _http_get_text(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 60) -> str:
+    request = Request(url, headers={"User-Agent": "PacBio-PureTarget-Prototype/1.0", **(headers or {})})
     try:
-        seq = fasta.fetch(chrom, start_1 - 1, end_1).upper()
-        return seq
-    finally:
-        fasta.close()
+        with urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8")
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code} for {url}\n{body}") from e
+    except URLError as e:
+        raise RuntimeError(f"Request failed for {url}: {e}") from e
+
+
+def ucsc_get_sequence(genome: str, chrom: str, start_1: int, end_1: int) -> str:
+    url = (
+        f"{UCSC_API}/getData/sequence?genome={quote(genome)};chrom={quote(chrom)};"
+        f"start={start_1 - 1};end={end_1}"
+    )
+    payload = _http_get_json(url)
+    seq = payload.get("dna") or payload.get("seq") or ""
+    if not seq:
+        raise RuntimeError(f"UCSC sequence API returned no sequence for {chrom}:{start_1}-{end_1}")
+    return str(seq).upper()
+
+
+def ucsc_get_track(genome: str, track: str, chrom: str, start_1: int, end_1: int) -> List[dict]:
+    url = (
+        f"{UCSC_API}/getData/track?genome={quote(genome)};track={quote(track)};chrom={quote(chrom)};"
+        f"start={start_1 - 1};end={end_1}"
+    )
+    payload = _http_get_json(url)
+    items = payload.get(track, [])
+    if isinstance(items, dict):
+        items = [items]
+    if not isinstance(items, list):
+        return []
+    return [x for x in items if isinstance(x, dict)]
+
+
+def ensembl_overlap_region(species: str, region: str, feature: str) -> List[dict]:
+    url = f"{ENSEMBL_API}/overlap/region/{quote(species)}/{quote(region)}?feature={quote(feature)}"
+    payload = _http_get_json(url, headers={"Content-Type": "application/json", "Accept": "application/json"})
+    if not isinstance(payload, list):
+        return []
+    return [x for x in payload if isinstance(x, dict)]
 
 
 def shannon_entropy(seq: str) -> float:
@@ -169,9 +180,6 @@ def make_windows(
     window_size: int,
     window_step: int,
 ) -> List[Tuple[str, int, int]]:
-    """
-    Returns windows as 1-based inclusive intervals.
-    """
     windows: List[Tuple[str, int, int]] = []
     cur = start_1
     while cur <= end_1:
@@ -184,223 +192,35 @@ def make_windows(
 
 
 def compute_window_metrics(
-    fasta_path: Path,
     chrom: str,
     start_1: int,
     end_1: int,
     window_size: int,
     window_step: int,
+    full_seq: str,
 ) -> pd.DataFrame:
     windows = make_windows(chrom, start_1, end_1, window_size, window_step)
     rows = []
 
-    fasta = pysam.FastaFile(str(fasta_path))
-    try:
-        for w_chrom, w_start, w_end in windows:
-            seq = fasta.fetch(w_chrom, w_start - 1, w_end).upper()
-            rows.append(
-                {
-                    "chrom": w_chrom,
-                    "start_1based": w_start,
-                    "end_1based": w_end,
-                    "start_0based": w_start - 1,
-                    "end_0based": w_end,
-                    "length_bp": len(seq),
-                    "gc_fraction": round(gc_fraction(seq), 6),
-                    "shannon_entropy": round(shannon_entropy(seq), 6),
-                    "n_fraction": round(
-                        (sum(1 for b in seq if b == "N") / len(seq)) if seq else float("nan"),
-                        6,
-                    ),
-                }
-            )
-    finally:
-        fasta.close()
-
-    return pd.DataFrame(rows)
-
-
-def detect_tabix_format(path: Path) -> str:
-    """
-    Heuristic based on extension.
-    """
-    name = path.name.lower()
-    if name.endswith(".vcf.gz"):
-        return "vcf"
-    if name.endswith(".bed.gz"):
-        return "bed"
-    if name.endswith(".gff.gz") or name.endswith(".gtf.gz"):
-        return "gff"
-    return "generic"
-
-
-def normalize_record(
-    raw_line: str,
-    source_name: str,
-    file_format: str,
-) -> Optional[Dict]:
-    """
-    Convert one line from a tabix fetch into a standardized dict.
-
-    Outputs 0-based half-open coordinates where possible.
-    Keeps raw columns too.
-    """
-    if not raw_line or raw_line.startswith("#"):
-        return None
-
-    fields = raw_line.rstrip("\n").split("\t")
-
-    if file_format == "vcf":
-        if len(fields) < 5:
-            return None
-        chrom = fields[0]
-        pos_1 = int(fields[1])
-        ref = fields[3]
-        alt = fields[4]
-        end_1 = pos_1 + len(ref) - 1
-        return {
-            "source": source_name,
-            "feature_type": "variant",
-            "chrom": chrom,
-            "start_0based": pos_1 - 1,
-            "end_0based": end_1,
-            "start_1based": pos_1,
-            "end_1based": end_1,
-            "name": alt,
-            "score": ".",
-            "strand": ".",
-            "raw": raw_line,
-        }
-
-    if file_format == "bed":
-        if len(fields) < 3:
-            return None
-        chrom = fields[0]
-        start_0 = int(fields[1])
-        end_0 = int(fields[2])
-        name = fields[3] if len(fields) > 3 else "."
-        score = fields[4] if len(fields) > 4 else "."
-        strand = fields[5] if len(fields) > 5 else "."
-        return {
-            "source": source_name,
-            "feature_type": "interval",
-            "chrom": chrom,
-            "start_0based": start_0,
-            "end_0based": end_0,
-            "start_1based": start_0 + 1,
-            "end_1based": end_0,
-            "name": name,
-            "score": score,
-            "strand": strand,
-            "raw": raw_line,
-        }
-
-    if file_format == "gff":
-        if len(fields) < 9:
-            return None
-        chrom = fields[0]
-        feature_type = fields[2]
-        start_1 = int(fields[3])
-        end_1 = int(fields[4])
-        score = fields[5]
-        strand = fields[6]
-        attrs = fields[8]
-        return {
-            "source": source_name,
-            "feature_type": feature_type,
-            "chrom": chrom,
-            "start_0based": start_1 - 1,
-            "end_0based": end_1,
-            "start_1based": start_1,
-            "end_1based": end_1,
-            "name": attrs,
-            "score": score,
-            "strand": strand,
-            "raw": raw_line,
-        }
-
-    # Generic tab-delimited fallback: assume BED-like at least 3 cols
-    if len(fields) >= 3:
-        chrom = fields[0]
-        start_0 = int(fields[1])
-        end_0 = int(fields[2])
-        name = fields[3] if len(fields) > 3 else "."
-        return {
-            "source": source_name,
-            "feature_type": "interval",
-            "chrom": chrom,
-            "start_0based": start_0,
-            "end_0based": end_0,
-            "start_1based": start_0 + 1,
-            "end_1based": end_0,
-            "name": name,
-            "score": ".",
-            "strand": ".",
-            "raw": raw_line,
-        }
-
-    return None
-
-
-def fetch_tabix_region(
-    path: Path,
-    chrom: str,
-    start_1: int,
-    end_1: int,
-    source_name: str,
-) -> pd.DataFrame:
-    """
-    Fetch region from a bgzip+tabix indexed file.
-    start_1/end_1 are 1-based inclusive.
-    tabix fetch uses 0-based, half-open region internally when numeric start/end are given.
-    """
-    tbi_path = Path(str(path) + ".tbi")
-    csi_path = Path(str(path) + ".csi")
-    if not tbi_path.exists() and not csi_path.exists():
-        raise FileNotFoundError(
-            f"Missing tabix index for {path}. Expected {tbi_path.name} or {csi_path.name}"
-        )
-
-    file_format = detect_tabix_format(path)
-    tbx = pysam.TabixFile(str(path))
-    rows: List[Dict] = []
-    try:
-        contigs = set(tbx.contigs)
-
-        query_chrom = chrom
-        if query_chrom not in contigs:
-            if chrom.startswith("chr") and chrom[3:] in contigs:
-                query_chrom = chrom[3:]
-            elif f"chr{chrom}" in contigs:
-                query_chrom = f"chr{chrom}"
-            else:
-                raise ValueError(
-                    f"Chromosome '{chrom}' not found in {path.name}. "
-                    f"Example contigs in file: {list(tbx.contigs)[:10]}"
-                )
-
-        for raw_line in tbx.fetch(query_chrom, start_1 - 1, end_1):
-            rec = normalize_record(raw_line, source_name=source_name, file_format=file_format)
-            if rec is not None:
-                rows.append(rec)
-    finally:
-        tbx.close()
-
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "source",
-                "feature_type",
-                "chrom",
-                "start_0based",
-                "end_0based",
-                "start_1based",
-                "end_1based",
-                "name",
-                "score",
-                "strand",
-                "raw",
-            ]
+    for w_chrom, w_start, w_end in windows:
+        offset0 = w_start - start_1
+        offset1 = w_end - start_1 + 1
+        seq = full_seq[offset0:offset1].upper()
+        rows.append(
+            {
+                "chrom": w_chrom,
+                "start_1based": w_start,
+                "end_1based": w_end,
+                "start_0based": w_start - 1,
+                "end_0based": w_end,
+                "length_bp": len(seq),
+                "gc_fraction": round(gc_fraction(seq), 6),
+                "shannon_entropy": round(shannon_entropy(seq), 6),
+                "n_fraction": round(
+                    (sum(1 for b in seq if b == "N") / len(seq)) if seq else float("nan"),
+                    6,
+                ),
+            }
         )
 
     return pd.DataFrame(rows)
@@ -416,7 +236,6 @@ def write_fasta(out_fa: Path, chrom: str, start_1: int, end_1: int, seq: str) ->
 
 
 def write_bed_single_interval(out_bed: Path, chrom: str, start_1: int, end_1: int) -> None:
-    # BED is 0-based, half-open
     with out_bed.open("w") as fh:
         fh.write(f"{chrom}\t{start_1 - 1}\t{end_1}\n")
 
@@ -450,31 +269,79 @@ def summarize_track(df: pd.DataFrame, source_name: str) -> Dict:
     }
 
 
+def normalize_ucsc_common_snps(items: List[dict], chrom: str) -> pd.DataFrame:
+    rows: List[dict] = []
+    for item in items:
+        start_0 = item.get("chromStart")
+        end_0 = item.get("chromEnd")
+        if start_0 is None or end_0 is None:
+            continue
+        name = item.get("name") or item.get("rsId") or "."
+        strand = item.get("strand") or "."
+        rows.append(
+            {
+                "source": "common_snps",
+                "feature_type": "variant",
+                "chrom": item.get("chrom", chrom),
+                "start_0based": int(start_0),
+                "end_0based": int(end_0),
+                "start_1based": int(start_0) + 1,
+                "end_1based": int(end_0),
+                "name": str(name),
+                "score": str(item.get("score", ".")),
+                "strand": str(strand),
+                "raw": json.dumps(item, sort_keys=True),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def normalize_ensembl_genes(items: List[dict], chrom: str) -> pd.DataFrame:
+    rows: List[dict] = []
+    for item in items:
+        start_1 = item.get("start")
+        end_1 = item.get("end")
+        if start_1 is None or end_1 is None:
+            continue
+        name = item.get("external_name") or item.get("gene_id") or item.get("id") or "."
+        strand_val = item.get("strand", 0)
+        strand = "+" if strand_val == 1 else "-" if strand_val == -1 else "."
+        rows.append(
+            {
+                "source": "genes",
+                "feature_type": "gene",
+                "chrom": item.get("seq_region_name", chrom if not chrom.startswith("chr") else chrom[3:]),
+                "start_0based": int(start_1) - 1,
+                "end_0based": int(end_1),
+                "start_1based": int(start_1),
+                "end_1based": int(end_1),
+                "name": str(name),
+                "score": ".",
+                "strand": strand,
+                "raw": json.dumps(item, sort_keys=True),
+            }
+        )
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["chrom"] = df["chrom"].astype(str).map(lambda x: x if x.startswith("chr") else f"chr{x}")
+    return df
+
+
 def main() -> int:
     args = parse_args()
+
+    if args.build != "hg38":
+        raise ValueError("This remote-annotation version currently supports hg38 only.")
 
     base_outdir = Path(args.outdir)
     base_outdir.mkdir(parents=True, exist_ok=True)
     outdir = base_outdir / "01_locus_annotation"
     outdir.mkdir(parents=True, exist_ok=True)
 
-    fasta_path = Path(args.fasta)
-    if not fasta_path.exists():
-        raise FileNotFoundError(f"FASTA not found: {fasta_path}")
-
     chrom, start_1, end_1 = parse_locus(args.locus)
-
-    ensure_fasta_index(fasta_path)
-    chrom_len = validate_chromosome_in_fasta(fasta_path, chrom)
-
-    if end_1 > chrom_len:
-        raise ValueError(
-            f"Locus end {end_1} exceeds chromosome length {chrom_len} for {chrom}"
-        )
-
     length_bp = end_1 - start_1 + 1
+    region_no_chr = f"{chrom[3:] if chrom.startswith('chr') else chrom}:{start_1}-{end_1}"
 
-    # Core outputs
     locus_meta = {
         "input_locus": args.locus,
         "build": args.build,
@@ -484,56 +351,47 @@ def main() -> int:
         "start_0based": start_1 - 1,
         "end_0based": end_1,
         "length_bp": length_bp,
-        "fasta": str(fasta_path.resolve()),
+        "sequence_source": "UCSC getData/sequence",
+        "gene_annotation_source": f"Ensembl overlap/region ({args.species}, feature=gene)",
+        "common_snp_source": f"UCSC getData/track ({args.ucsc_snp_track})",
     }
-
     (outdir / "locus.json").write_text(json.dumps(locus_meta, indent=2))
     write_bed_single_interval(outdir / "locus.bed", chrom, start_1, end_1)
 
-    seq = fetch_sequence(fasta_path, chrom, start_1, end_1)
+    seq = ucsc_get_sequence(args.build, chrom, start_1, end_1)
     write_fasta(outdir / "locus.fa", chrom, start_1, end_1, seq)
+    time.sleep(args.request_sleep_seconds)
 
     window_df = compute_window_metrics(
-        fasta_path=fasta_path,
         chrom=chrom,
         start_1=start_1,
         end_1=end_1,
         window_size=args.window_size,
         window_step=args.window_step,
+        full_seq=seq,
     )
     window_df.to_csv(outdir / "sequence_windows.tsv", sep="\t", index=False)
 
-    # Optional annotation tracks
-    track_specs = [
-        ("common_snps", args.common_snps),
-        ("repeats", args.repeats),
-        ("segdups", args.segdups),
-        ("genes", args.genes),
-    ]
+    common_snps_df = normalize_ucsc_common_snps(
+        ucsc_get_track(args.build, args.ucsc_snp_track, chrom, start_1, end_1),
+        chrom=chrom,
+    )
+    time.sleep(args.request_sleep_seconds)
+
+    genes_df = normalize_ensembl_genes(
+        ensembl_overlap_region(args.species, region_no_chr, "gene"),
+        chrom=chrom,
+    )
+
+    common_snps_df.to_csv(outdir / "common_snps.tsv", sep="\t", index=False)
+    genes_df.to_csv(outdir / "genes.tsv", sep="\t", index=False)
+    write_annotation_bed(common_snps_df, outdir / "common_snps.bed")
+    write_annotation_bed(genes_df, outdir / "genes.bed")
 
     merged_tracks: List[pd.DataFrame] = []
     summaries: List[Dict] = []
-
-    for track_name, path_str in track_specs:
-        if not path_str:
-            continue
-
-        path = Path(path_str)
-        if not path.exists():
-            raise FileNotFoundError(f"{track_name} file not found: {path}")
-
-        df = fetch_tabix_region(
-            path=path,
-            chrom=chrom,
-            start_1=start_1,
-            end_1=end_1,
-            source_name=track_name,
-        )
-
-        df.to_csv(outdir / f"{track_name}.tsv", sep="\t", index=False)
-        write_annotation_bed(df, outdir / f"{track_name}.bed")
+    for track_name, df in [("common_snps", common_snps_df), ("genes", genes_df)]:
         summaries.append(summarize_track(df, track_name))
-
         if not df.empty:
             merged_tracks.append(df)
 
@@ -562,16 +420,11 @@ def main() -> int:
     print(f"[OK] Wrote normalized locus outputs to: {outdir}", file=sys.stderr)
     print(f"[OK] Locus length: {length_bp} bp", file=sys.stderr)
     print(f"[OK] Sequence windows: {len(window_df)}", file=sys.stderr)
-
-    if summaries:
-        for s in summaries:
-            print(
-                f"[OK] {s['source']}: {s['n_records']} records, "
-                f"{s['total_bp_covered_naive_sum']} bp naive summed span",
-                file=sys.stderr,
-            )
-    else:
-        print("[INFO] No annotation tracks provided; only locus normalization + sequence metrics were run.", file=sys.stderr)
+    for s in summaries:
+        print(
+            f"[OK] {s['source']}: {s['n_records']} records, {s['total_bp_covered_naive_sum']} bp naive summed span",
+            file=sys.stderr,
+        )
 
     return 0
 

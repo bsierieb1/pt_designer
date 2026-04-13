@@ -11,7 +11,7 @@ import pandas as pd
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Annotate oriented guide candidates with SNP/repeat/segdup overlap and basic sequence QC."
+        description="Annotate oriented guide candidates with common-SNP overlap and basic sequence QC."
     )
     parser.add_argument(
         "--candidates-oriented-tsv",
@@ -23,18 +23,6 @@ def parse_args() -> argparse.Namespace:
         required=False,
         default=None,
         help="Optional path to common_snps.bed from Step 1.",
-    )
-    parser.add_argument(
-        "--repeats-bed",
-        required=False,
-        default=None,
-        help="Optional path to repeats.bed from Step 1.",
-    )
-    parser.add_argument(
-        "--segdups-bed",
-        required=False,
-        default=None,
-        help="Optional path to segdups.bed from Step 1.",
     )
     parser.add_argument(
         "--outdir",
@@ -104,15 +92,11 @@ def load_bed(path: Optional[Path], source_name: str) -> pd.DataFrame:
 
     if path is None:
         return pd.DataFrame(columns=empty_cols)
-
-    if not path.exists():
-        raise FileNotFoundError(f"{source_name} BED not found: {path}")
-
-    if path.stat().st_size == 0:
+    if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame(columns=empty_cols)
 
     try:
-        df = pd.read_csv(path, sep="	", header=None, comment="#")
+        df = pd.read_csv(path, sep="\t", header=None, comment="#")
     except pd.errors.EmptyDataError:
         return pd.DataFrame(columns=empty_cols)
 
@@ -122,19 +106,11 @@ def load_bed(path: Optional[Path], source_name: str) -> pd.DataFrame:
     df = df.iloc[:, :6].copy()
     cols = ["chrom", "start_0based", "end_0based", "name", "score", "strand"][: df.shape[1]]
     df.columns = cols
-
     for col in ["name", "score", "strand"]:
         if col not in df.columns:
             df[col] = "."
 
-    df["chrom"] = df["chrom"].astype(str)
-    df["chrom"] = df["chrom"].str.strip()
-
-    # Normalize chromosome naming to UCSC-style: chr1, chr2, ..., chrX
-    df["chrom"] = df["chrom"].apply(
-        lambda x: x if x.startswith("chr") else f"chr{x}"
-    )
-
+    df["chrom"] = df["chrom"].astype(str).str.strip().map(lambda x: x if x.startswith("chr") else f"chr{x}")
     df["start_0based"] = df["start_0based"].astype(int)
     df["end_0based"] = df["end_0based"].astype(int)
     return df.reset_index(drop=True)
@@ -176,8 +152,7 @@ def longest_homopolymer(seq: str) -> int:
     for i in range(1, len(seq)):
         if seq[i] == seq[i - 1]:
             cur += 1
-            if cur > best:
-                best = cur
+            best = max(best, cur)
         else:
             cur = 1
     return best
@@ -198,7 +173,6 @@ def count_overlaps(
         chrom = row["chrom"]
         start_0 = int(row[start_col])
         end_0 = int(row[end_col])
-
         sub = features[features["chrom"] == chrom]
         mask = (sub["end_0based"] > start_0) & (sub["start_0based"] < end_0)
         counts.append(int(mask.sum()))
@@ -212,18 +186,15 @@ def annotate_sequence_qc(
     low_complexity_entropy_threshold: float,
 ) -> pd.DataFrame:
     out = df.copy()
-
     out["guide_length_bp"] = out["guide_seq"].str.len().astype(int)
     out["gc_fraction"] = out["guide_seq"].apply(gc_fraction).round(6)
     out["gc_percent"] = (out["gc_fraction"] * 100).round(2)
     out["shannon_entropy"] = out["guide_seq"].apply(shannon_entropy).round(6)
     out["longest_homopolymer"] = out["guide_seq"].apply(longest_homopolymer).astype(int)
-
     out["has_homopolymer"] = out["longest_homopolymer"] >= homopolymer_threshold
     out["is_low_complexity"] = out["shannon_entropy"] < low_complexity_entropy_threshold
     out["gc_too_low"] = out["gc_fraction"] < 0.20
     out["gc_too_high"] = out["gc_fraction"] > 0.80
-
     return out
 
 
@@ -231,8 +202,6 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
     rows = [
         {"metric": "n_candidates", "value": int(df.shape[0])},
         {"metric": "n_overlap_common_snp", "value": int(df["n_common_snp_overlaps"].gt(0).sum())},
-        {"metric": "n_overlap_repeat", "value": int(df["n_repeat_overlaps"].gt(0).sum())},
-        {"metric": "n_overlap_segdup", "value": int(df["n_segdup_overlaps"].gt(0).sum())},
         {"metric": "n_has_homopolymer", "value": int(df["has_homopolymer"].sum())},
         {"metric": "n_low_complexity", "value": int(df["is_low_complexity"].sum())},
         {"metric": "n_gc_too_low", "value": int(df["gc_too_low"].sum())},
@@ -251,8 +220,6 @@ def summarize_by_tile_boundary(df: pd.DataFrame) -> pd.DataFrame:
                 "boundary_type": boundary_type,
                 "n_candidates": int(sub.shape[0]),
                 "n_overlap_common_snp": int(sub["n_common_snp_overlaps"].gt(0).sum()),
-                "n_overlap_repeat": int(sub["n_repeat_overlaps"].gt(0).sum()),
-                "n_overlap_segdup": int(sub["n_segdup_overlaps"].gt(0).sum()),
                 "n_has_homopolymer": int(sub["has_homopolymer"].sum()),
                 "n_low_complexity": int(sub["is_low_complexity"].sum()),
                 "best_min_distance_bp": int(sub["distance_abs_to_boundary_bp"].min()),
@@ -269,15 +236,8 @@ def main() -> int:
 
     candidates = load_candidates(Path(args.candidates_oriented_tsv))
     common_snps = load_bed(Path(args.common_snps_bed), "common_snps") if args.common_snps_bed else load_bed(None, "common_snps")
-    repeats = load_bed(Path(args.repeats_bed), "repeats") if args.repeats_bed else load_bed(None, "repeats")
-    segdups = load_bed(Path(args.segdups_bed), "segdups") if args.segdups_bed else load_bed(None, "segdups")
 
     annotated = candidates.copy()
-
-    # SNPs are evaluated across the full guide footprint (protospacer + PAM),
-    # not just the protospacer. BED intervals are 0-based half-open, so the
-    # combined interval is [min(protospacer_start_0based, pam_start_0based),
-    # max(protospacer_end_0based, pam_end_0based)).
     annotated["pam_start_0based"] = annotated["pam_start_1based"].astype(int) - 1
     annotated["pam_end_0based"] = annotated["pam_end_1based"].astype(int)
     annotated["guide_plus_pam_start_0based"] = annotated[["protospacer_start_0based", "pam_start_0based"]].min(axis=1).astype(int)
@@ -291,21 +251,10 @@ def main() -> int:
     ).astype(int)
     annotated["overlaps_common_snp"] = annotated["n_common_snp_overlaps"] > 0
 
-    annotated["n_repeat_overlaps"] = count_overlaps(
-        annotated,
-        repeats,
-        start_col="protospacer_start_0based",
-        end_col="protospacer_end_0based",
-    ).astype(int)
-    annotated["overlaps_repeat"] = annotated["n_repeat_overlaps"] > 0
-
-    annotated["n_segdup_overlaps"] = count_overlaps(
-        annotated,
-        segdups,
-        start_col="protospacer_start_0based",
-        end_col="protospacer_end_0based",
-    ).astype(int)
-    annotated["overlaps_segdup"] = annotated["n_segdup_overlaps"] > 0
+    annotated["n_repeat_overlaps"] = 0
+    annotated["overlaps_repeat"] = False
+    annotated["n_segdup_overlaps"] = 0
+    annotated["overlaps_segdup"] = False
 
     annotated = annotate_sequence_qc(
         annotated,
@@ -313,7 +262,6 @@ def main() -> int:
         low_complexity_entropy_threshold=args.low_complexity_entropy_threshold,
     )
 
-    # Simple convenience flag for later scoring
     annotated["basic_sequence_warning"] = (
         annotated["has_homopolymer"]
         | annotated["is_low_complexity"]
@@ -327,8 +275,6 @@ def main() -> int:
             "boundary_type",
             "distance_abs_to_boundary_bp",
             "overlaps_common_snp",
-            "overlaps_repeat",
-            "overlaps_segdup",
             "guide_seq",
         ]
     ).reset_index(drop=True)

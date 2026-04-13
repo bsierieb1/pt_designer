@@ -18,10 +18,6 @@ def collect_warnings(row) -> str:
     for col, label in [
         ("left_overlaps_common_snp", "left_snp"),
         ("right_overlaps_common_snp", "right_snp"),
-        ("left_overlaps_repeat", "left_repeat"),
-        ("right_overlaps_repeat", "right_repeat"),
-        ("left_overlaps_segdup", "left_segdup"),
-        ("right_overlaps_segdup", "right_segdup"),
         ("left_basic_sequence_warning", "left_seq_warning"),
         ("right_basic_sequence_warning", "right_seq_warning"),
         ("left_has_homopolymer", "left_homopolymer"),

@@ -19,9 +19,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--selected-pairs-tsv", help="Step 8 selected pairs TSV for iterative mode")
     p.add_argument("--tile-plan-tsv", help="Current full tile plan TSV for iterative mode")
     p.add_argument("--locus-json", required=True)
-    p.add_argument("--fasta", required=True)
-    p.add_argument("--flashfry-jar", required=True)
-    p.add_argument("--flashfry-database", required=True)
+    p.add_argument("--fasta")
+    p.add_argument("--flashfry-jar")
+    p.add_argument("--flashfry-database")
     p.add_argument("--scripts-dir", required=True)
     p.add_argument("--base-output-dir", required=True)
     p.add_argument("--common-snps-bed")
@@ -131,31 +131,23 @@ def rerun_pipeline(tiles_tsv: Path, outdir: Path, args: argparse.Namespace, quie
     outdir.mkdir(parents=True, exist_ok=True)
 
     step03 = outdir / "03_boundary_windows"
-    step04 = outdir / "04_scan_pams"
+    step04 = outdir / "04_fetch_guides"
     step05 = outdir / "05_oriented"
     step06a = outdir / "06a_annotated"
-    step06b = outdir / "06b_ontarget"
-    step06c = outdir / "06c_offtargets"
     step06d = outdir / "06d_ranked"
     step07 = outdir / "07_paired"
     step08 = outdir / "08_global"
 
     run([py, str(scripts / "03_make_boundary_windows.py"), "--locus-json", args.locus_json, "--tiles-tsv", str(tiles_tsv), "--outdir", str(step03)], quiet)
-    run([py, str(scripts / "04_scan_pams.py"), "--boundary-windows-tsv", str(step03 / "boundary_windows.tsv"), "--fasta", args.fasta, "--outdir", str(step04)], quiet)
+    run([py, str(scripts / "04_fetch_guides.py"), "--boundary-windows-tsv", str(step03 / "boundary_windows.tsv"), "--outdir", str(step04)], quiet)
     run([py, str(scripts / "05_filter_orientation.py"), "--candidates-raw-tsv", str(step04 / "candidates_raw.tsv"), "--outdir", str(step05)], quiet)
 
     cmd06a = [py, str(scripts / "06a_annotate_guides.py"), "--candidates-oriented-tsv", str(step05 / "candidates_oriented.tsv"), "--outdir", str(step06a)]
     if args.common_snps_bed:
         cmd06a += ["--common-snps-bed", args.common_snps_bed]
-    if args.repeats_bed:
-        cmd06a += ["--repeats-bed", args.repeats_bed]
-    if args.segdups_bed:
-        cmd06a += ["--segdups-bed", args.segdups_bed]
     run(cmd06a, quiet)
 
-    run([py, str(scripts / "06b_score_ontarget.py"), "--candidates-annotated-tsv", str(step06a / "candidates_annotated.tsv"), "--fasta", args.fasta, "--outdir", str(step06b), "--tracr-rna", str(args.tracr_rna)], quiet)
-    run([py, str(scripts / "06c_score_offtarget.py"), "--candidates-ontarget-tsv", str(step06b / "candidates_ontarget.tsv"), "--locus-json", args.locus_json, "--fasta", args.fasta, "--flashfry-jar", args.flashfry_jar, "--database", args.flashfry_database, "--outdir", str(step06c), "--max-mismatches", str(args.max_mismatches)], quiet)
-    run([py, str(scripts / "06d_rank_guides.py"), "--candidates-annotated-tsv", str(step06a / "candidates_annotated.tsv"), "--candidates-ontarget-tsv", str(step06b / "candidates_ontarget.tsv"), "--offtarget-scores-tsv", str(step06c / "offtarget_scores.tsv"), "--outdir", str(step06d)], quiet)
+    run([py, str(scripts / "06d_rank_guides.py"), "--candidates-annotated-tsv", str(step06a / "candidates_annotated.tsv"), "--outdir", str(step06d)], quiet)
     run([py, str(scripts / "07_pair_guides.py"), "--drop-unacceptable-pairs", "--candidates-scored-tsv", str(step06d / "candidates_scored.tsv"), "--outdir", str(step07)], quiet)
     run([py, str(scripts / "08_optimize_tiles.py"), "--guide-pairs-tsv", str(step07 / "guide_pairs_top.tsv"), "--outdir", str(step08)], quiet)
 
@@ -512,7 +504,7 @@ def write_search_html(search_dir: Path, locus_label: str = "") -> Path:
 def iterative_redesign(args: argparse.Namespace) -> int:
     scripts = Path(args.scripts_dir)
     base = Path(args.base_output_dir)
-    outdir = base / "09_redesign_iterative"
+    outdir = base / "09c_redesign_iterative"
     outdir.mkdir(parents=True, exist_ok=True)
     search_dir = outdir / "search_history"
     search_dir.mkdir(parents=True, exist_ok=True)

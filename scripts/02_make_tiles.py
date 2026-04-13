@@ -90,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Step size for internal boundary optimization. Default: 100",
     )
+    parser.add_argument(
+        "--force-single-tile",
+        action="store_true",
+        help="Emit one full-locus tile regardless of locus size.",
+    )
 
     return parser.parse_args()
 
@@ -454,13 +459,16 @@ def main() -> int:
         chrom=chrom,
     )
 
-    initial_tiles = build_initial_tiles(
-        chrom=chrom,
-        locus_start_1=locus_start_1,
-        locus_end_1=locus_end_1,
-        target_tile_size=args.target_tile_size,
-        target_overlap_size=args.target_overlap_size,
-    )
+    if args.force_single_tile:
+        initial_tiles = [Tile(1, chrom, locus_start_1, locus_end_1)]
+    else:
+        initial_tiles = build_initial_tiles(
+            chrom=chrom,
+            locus_start_1=locus_start_1,
+            locus_end_1=locus_end_1,
+            target_tile_size=args.target_tile_size,
+            target_overlap_size=args.target_overlap_size,
+        )
 
     initial_tiles_df = pd.DataFrame([tile_to_dict(t) for t in initial_tiles])
     initial_overlaps_df = compute_overlaps(initial_tiles, snps_df)
@@ -493,6 +501,7 @@ def main() -> int:
         "max_tile_size": args.max_tile_size,
         "boundary_shift_max": args.boundary_shift_max,
         "boundary_shift_step": args.boundary_shift_step,
+        "force_single_tile": bool(args.force_single_tile),
         "n_tiles_initial": int(initial_tiles_df.shape[0]),
         "n_tiles_optimized": int(optimized_tiles_df.shape[0]),
         "initial_total_overlap_snps": int(initial_score[0]),
