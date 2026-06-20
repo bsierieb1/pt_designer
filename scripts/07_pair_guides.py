@@ -228,6 +228,9 @@ def build_pairs(df: pd.DataFrame) -> pd.DataFrame:
         + pairs['pair_n_homopolymer_guides']
         + pairs['pair_n_low_complexity_guides']
     ).astype(int)
+    pairs['pair_total_basic_sequence_warnings'] = pairs['pair_n_basic_sequence_warnings']
+    pairs['pair_total_homopolymer_flags'] = pairs['pair_n_homopolymer_guides']
+    pairs['pair_total_low_complexity_flags'] = pairs['pair_n_low_complexity_guides']
 
     for count_col, pair_col in [
         ('n_common_snp_overlaps', 'pair_total_common_snp_overlaps'),

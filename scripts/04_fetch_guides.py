@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -52,6 +53,16 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Sleep between UCSC API requests. Default: 1.0",
     )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Directory for cached UCSC JSON responses. Default: <outdir>/ucsc_cache",
+    )
+    parser.add_argument(
+        "--disable-window-merge",
+        action="store_true",
+        help="Fetch every boundary window independently instead of merging overlapping windows.",
+    )
     return parser.parse_args()
 
 
@@ -65,6 +76,33 @@ def _http_get_json(url: str, timeout: int = 60) -> dict:
         raise RuntimeError(f"HTTP {e.code} for {url}\n{body}") from e
     except URLError as e:
         raise RuntimeError(f"Request failed for {url}: {e}") from e
+
+
+def _http_get_json_cached(
+    url: str,
+    *,
+    cache_dir: Optional[Path],
+    stats: Dict[str, int],
+    timeout: int = 60,
+) -> Tuple[dict, bool]:
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_key = hashlib.sha1(url.encode("utf-8")).hexdigest()
+        cache_path = cache_dir / f"{cache_key}.json"
+        if cache_path.exists():
+            try:
+                stats["cache_hits"] += 1
+                return json.loads(cache_path.read_text(encoding="utf-8")), True
+            except json.JSONDecodeError:
+                stats["cache_corrupt"] += 1
+
+    payload = _http_get_json(url, timeout=timeout)
+    stats["cache_misses"] += 1
+
+    if cache_dir is not None:
+        cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    return payload, False
 
 
 def reverse_complement(seq: str) -> str:
@@ -95,30 +133,130 @@ def load_boundary_windows(path: Path) -> pd.DataFrame:
     return df.sort_values(["tile_id", "boundary_type"]).reset_index(drop=True)
 
 
-def ucsc_get_track(genome: str, track: str, chrom: str, start_1: int, end_1: int) -> List[dict]:
+def build_fetch_windows(boundary_df: pd.DataFrame, merge_windows: bool = True) -> pd.DataFrame:
+    work = (
+        boundary_df[["chrom", "window_start_1based", "window_end_1based"]]
+        .drop_duplicates()
+        .sort_values(["chrom", "window_start_1based", "window_end_1based"])
+        .reset_index(drop=True)
+    )
+
+    rows: List[Dict] = []
+    if not merge_windows:
+        for idx, row in work.iterrows():
+            rows.append(
+                {
+                    "fetch_window_id": idx + 1,
+                    "chrom": row["chrom"],
+                    "fetch_start_1based": int(row["window_start_1based"]),
+                    "fetch_end_1based": int(row["window_end_1based"]),
+                }
+            )
+        return pd.DataFrame(rows)
+
+    fetch_id = 0
+    for chrom, sub in work.groupby("chrom", sort=True):
+        cur_start = None
+        cur_end = None
+        for _, row in sub.iterrows():
+            start = int(row["window_start_1based"])
+            end = int(row["window_end_1based"])
+            if cur_start is None:
+                cur_start = start
+                cur_end = end
+                continue
+            if start <= int(cur_end) + 1:
+                cur_end = max(int(cur_end), end)
+                continue
+
+            fetch_id += 1
+            rows.append(
+                {
+                    "fetch_window_id": fetch_id,
+                    "chrom": chrom,
+                    "fetch_start_1based": int(cur_start),
+                    "fetch_end_1based": int(cur_end),
+                }
+            )
+            cur_start = start
+            cur_end = end
+
+        if cur_start is not None:
+            fetch_id += 1
+            rows.append(
+                {
+                    "fetch_window_id": fetch_id,
+                    "chrom": chrom,
+                    "fetch_start_1based": int(cur_start),
+                    "fetch_end_1based": int(cur_end),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def assign_fetch_window_ids(boundary_df: pd.DataFrame, fetch_windows: pd.DataFrame) -> pd.DataFrame:
+    out = boundary_df.copy()
+    assigned_ids: List[int] = []
+
+    for _, row in out.iterrows():
+        chrom = row["chrom"]
+        start = int(row["window_start_1based"])
+        end = int(row["window_end_1based"])
+        match = fetch_windows[
+            (fetch_windows["chrom"] == chrom)
+            & (fetch_windows["fetch_start_1based"] <= start)
+            & (fetch_windows["fetch_end_1based"] >= end)
+        ]
+        if match.empty:
+            raise RuntimeError(f"No fetch window contains {chrom}:{start}-{end}")
+        assigned_ids.append(int(match.iloc[0]["fetch_window_id"]))
+
+    out["fetch_window_id"] = assigned_ids
+    return out
+
+
+def ucsc_get_track(
+    genome: str,
+    track: str,
+    chrom: str,
+    start_1: int,
+    end_1: int,
+    *,
+    cache_dir: Optional[Path],
+    stats: Dict[str, int],
+) -> Tuple[List[dict], bool]:
     url = (
         f"{UCSC_API}/getData/track?genome={quote(genome)};track={quote(track)};chrom={quote(chrom)};"
         f"start={start_1 - 1};end={end_1}"
     )
-    payload = _http_get_json(url)
+    payload, from_cache = _http_get_json_cached(url, cache_dir=cache_dir, stats=stats)
     items = payload.get(track, [])
     if isinstance(items, dict):
         items = [items]
     if not isinstance(items, list):
-        return []
-    return [x for x in items if isinstance(x, dict)]
+        return [], from_cache
+    return [x for x in items if isinstance(x, dict)], from_cache
 
 
-def ucsc_get_sequence(genome: str, chrom: str, start_1: int, end_1: int) -> str:
+def ucsc_get_sequence(
+    genome: str,
+    chrom: str,
+    start_1: int,
+    end_1: int,
+    *,
+    cache_dir: Optional[Path],
+    stats: Dict[str, int],
+) -> Tuple[str, bool]:
     url = (
         f"{UCSC_API}/getData/sequence?genome={quote(genome)};chrom={quote(chrom)};"
         f"start={start_1 - 1};end={end_1}"
     )
-    payload = _http_get_json(url)
+    payload, from_cache = _http_get_json_cached(url, cache_dir=cache_dir, stats=stats)
     seq = payload.get("dna") or payload.get("seq") or ""
     if not seq:
         raise RuntimeError(f"UCSC sequence API returned no sequence for {chrom}:{start_1}-{end_1}")
-    return str(seq).upper()
+    return str(seq).upper(), from_cache
 
 
 def first_nonnull(item: dict, keys: List[str], default=None):
@@ -287,8 +425,53 @@ def main() -> int:
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else outdir / "ucsc_cache"
 
     boundary_df = load_boundary_windows(Path(args.boundary_windows_tsv))
+    fetch_windows = build_fetch_windows(
+        boundary_df,
+        merge_windows=not args.disable_window_merge,
+    )
+    boundary_df = assign_fetch_window_ids(boundary_df, fetch_windows)
+
+    cache_stats = {"cache_hits": 0, "cache_misses": 0, "cache_corrupt": 0}
+    fetched: Dict[int, Dict] = {}
+    for _, row in fetch_windows.iterrows():
+        fetch_window_id = int(row["fetch_window_id"])
+        chrom = row["chrom"]
+        fetch_start_1based = int(row["fetch_start_1based"])
+        fetch_end_1based = int(row["fetch_end_1based"])
+
+        seq, seq_from_cache = ucsc_get_sequence(
+            genome=args.genome,
+            chrom=chrom,
+            start_1=fetch_start_1based,
+            end_1=fetch_end_1based,
+            cache_dir=cache_dir,
+            stats=cache_stats,
+        )
+        if not seq_from_cache and args.request_sleep_seconds > 0:
+            time.sleep(args.request_sleep_seconds)
+
+        items, track_from_cache = ucsc_get_track(
+            genome=args.genome,
+            track=args.ucsc_track,
+            chrom=chrom,
+            start_1=fetch_start_1based,
+            end_1=fetch_end_1based,
+            cache_dir=cache_dir,
+            stats=cache_stats,
+        )
+        if not track_from_cache and args.request_sleep_seconds > 0:
+            time.sleep(args.request_sleep_seconds)
+
+        fetched[fetch_window_id] = {
+            "chrom": chrom,
+            "fetch_start_1based": fetch_start_1based,
+            "fetch_end_1based": fetch_end_1based,
+            "sequence": seq,
+            "items": items,
+        }
 
     all_rows: List[Dict] = []
     for _, row in boundary_df.iterrows():
@@ -298,24 +481,20 @@ def main() -> int:
         desired_boundary_1based = int(row["desired_boundary_1based"])
         window_start_1based = int(row["window_start_1based"])
         window_end_1based = int(row["window_end_1based"])
+        fetch_window_id = int(row["fetch_window_id"])
+        payload = fetched[fetch_window_id]
+        fetch_start_1based = int(payload["fetch_start_1based"])
+        local_start = window_start_1based - fetch_start_1based
+        local_end = window_end_1based - fetch_start_1based + 1
+        window_seq = str(payload["sequence"])[local_start:local_end]
+        expected_len = window_end_1based - window_start_1based + 1
+        if len(window_seq) != expected_len:
+            raise RuntimeError(
+                f"Merged UCSC sequence slice has length {len(window_seq)} for "
+                f"{chrom}:{window_start_1based}-{window_end_1based}; expected {expected_len}"
+            )
 
-        window_seq = ucsc_get_sequence(
-            genome=args.genome,
-            chrom=chrom,
-            start_1=window_start_1based,
-            end_1=window_end_1based,
-        )
-        time.sleep(args.request_sleep_seconds)
-        items = ucsc_get_track(
-            genome=args.genome,
-            track=args.ucsc_track,
-            chrom=chrom,
-            start_1=window_start_1based,
-            end_1=window_end_1based,
-        )
-        time.sleep(args.request_sleep_seconds)
-
-        for item in items:
+        for item in payload["items"]:
             built = build_row(
                 item=item,
                 chrom=chrom,
@@ -366,6 +545,10 @@ def main() -> int:
         )
         summary = {
             "n_boundary_windows": int(boundary_df.shape[0]),
+            "n_fetch_windows": int(fetch_windows.shape[0]),
+            "n_ucsc_cache_hits": int(cache_stats["cache_hits"]),
+            "n_ucsc_cache_misses": int(cache_stats["cache_misses"]),
+            "n_ucsc_cache_corrupt": int(cache_stats["cache_corrupt"]),
             "n_candidates_total": 0,
             "n_candidates_plus": 0,
             "n_candidates_minus": 0,
@@ -387,6 +570,10 @@ def main() -> int:
         ).reset_index(drop=True)
         summary = {
             "n_boundary_windows": int(boundary_df.shape[0]),
+            "n_fetch_windows": int(fetch_windows.shape[0]),
+            "n_ucsc_cache_hits": int(cache_stats["cache_hits"]),
+            "n_ucsc_cache_misses": int(cache_stats["cache_misses"]),
+            "n_ucsc_cache_corrupt": int(cache_stats["cache_corrupt"]),
             "n_candidates_total": int(candidates_df.shape[0]),
             "n_candidates_plus": int((candidates_df["strand"] == "+").sum()),
             "n_candidates_minus": int((candidates_df["strand"] == "-").sum()),

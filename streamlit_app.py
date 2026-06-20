@@ -261,6 +261,8 @@ def build_commands(
         str(run_dir / "03_boundaries" / "boundary_windows.tsv"),
         "--outdir",
         str(run_dir / "04_candidates"),
+        "--cache-dir",
+        str(run_dir / "ucsc_cache"),
     ]
 
     step05 = [
@@ -350,6 +352,8 @@ def build_commands(
         str(scripts_dir),
         "--base-output-dir",
         str(run_dir),
+        "--ucsc-cache-dir",
+        str(run_dir / "ucsc_cache"),
     ]
 
     step10a = [

@@ -8,9 +8,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import pandas as pd
+from pandas.errors import EmptyDataError
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,10 +37,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-tile-size-bp", type=int, default=12000)
     p.add_argument("--target-overlap-size-bp", type=int, default=1200)
     p.add_argument("--min-overlap-bp", type=int, default=800)
+    p.add_argument("--min-overlap-snp-count", type=int, default=1)
     p.add_argument("--max-candidate-plans", type=int, default=24)
     p.add_argument("--early-stop-min-pair-score", type=float, default=120.0)
     p.add_argument("--show-substep-output", action="store_true")
     p.add_argument("--tile-overlaps-tsv", help="Optional overlap TSV passed to 09a")
+    p.add_argument("--ucsc-cache-dir", help="Shared cache directory for UCSC responses during redesign.")
     return p.parse_args()
 
 
@@ -64,6 +67,34 @@ def choose_col(df: pd.DataFrame, candidates: Iterable[str], required: bool = Fal
     if required:
         raise ValueError(f"None of the required columns found: {list(candidates)}")
     return None
+
+
+def load_common_snps_bed(path: Optional[Path]) -> pd.DataFrame:
+    cols = ["chrom", "start_0based", "end_0based", "name", "score", "strand"]
+    if path is None or not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=cols)
+
+    try:
+        df = pd.read_csv(path, sep="\t", header=None, comment="#")
+    except EmptyDataError:
+        return pd.DataFrame(columns=cols)
+
+    if df.shape[1] < 3:
+        raise ValueError(f"common SNP BED must have at least 3 columns: {path}")
+
+    df = df.iloc[:, :6].copy()
+    df.columns = cols[: df.shape[1]]
+    for col in ["name", "score", "strand"]:
+        if col not in df.columns:
+            df[col] = "."
+
+    df["chrom"] = df["chrom"].astype(str).str.strip().map(lambda x: x if x.startswith("chr") else f"chr{x}")
+    df["start_0based"] = pd.to_numeric(df["start_0based"], errors="coerce")
+    df["end_0based"] = pd.to_numeric(df["end_0based"], errors="coerce")
+    df = df.dropna(subset=["chrom", "start_0based", "end_0based"]).copy()
+    df["start_0based"] = df["start_0based"].astype(int)
+    df["end_0based"] = df["end_0based"].astype(int)
+    return df.reset_index(drop=True)
 
 
 def standardize_tile_plan(df: pd.DataFrame) -> pd.DataFrame:
@@ -139,7 +170,17 @@ def rerun_pipeline(tiles_tsv: Path, outdir: Path, args: argparse.Namespace, quie
     step08 = outdir / "08_global"
 
     run([py, str(scripts / "03_make_boundary_windows.py"), "--locus-json", args.locus_json, "--tiles-tsv", str(tiles_tsv), "--outdir", str(step03)], quiet)
-    run([py, str(scripts / "04_fetch_guides.py"), "--boundary-windows-tsv", str(step03 / "boundary_windows.tsv"), "--outdir", str(step04)], quiet)
+    cache_dir = Path(args.ucsc_cache_dir) if args.ucsc_cache_dir else Path(args.base_output_dir) / "ucsc_cache"
+    run([
+        py,
+        str(scripts / "04_fetch_guides.py"),
+        "--boundary-windows-tsv",
+        str(step03 / "boundary_windows.tsv"),
+        "--outdir",
+        str(step04),
+        "--cache-dir",
+        str(cache_dir),
+    ], quiet)
     run([py, str(scripts / "05_filter_orientation.py"), "--candidates-raw-tsv", str(step04 / "candidates_raw.tsv"), "--outdir", str(step05)], quiet)
 
     cmd06a = [py, str(scripts / "06a_annotate_guides.py"), "--candidates-oriented-tsv", str(step05 / "candidates_oriented.tsv"), "--outdir", str(step06a)]
@@ -180,22 +221,56 @@ def merge_tile_plans(current_tiles: pd.DataFrame, candidate_tiles: pd.DataFrame)
     return merged
 
 
-def adjacent_overlap_metrics(tiles: pd.DataFrame):
+def count_snps_in_interval(
+    common_snps: pd.DataFrame,
+    chrom: str,
+    start_1based: Optional[int],
+    end_1based: Optional[int],
+) -> Optional[int]:
+    if common_snps is None or common_snps.empty or start_1based is None or end_1based is None:
+        return None
+    start_0based = int(start_1based) - 1
+    end_0based = int(end_1based)
+    sub = common_snps[common_snps["chrom"] == str(chrom)]
+    if sub.empty:
+        return 0
+    mask = (sub["end_0based"] > start_0based) & (sub["start_0based"] < end_0based)
+    return int(mask.sum())
+
+
+def adjacent_overlap_metrics(tiles: pd.DataFrame, common_snps: Optional[pd.DataFrame] = None):
     tiles = standardize_tile_plan(tiles)
-    bad = []
+    rows = []
     min_overlap = None
     for i in range(len(tiles) - 1):
         left = tiles.iloc[i]
         right = tiles.iloc[i + 1]
-        overlap = int(left["end_1based"] - right["start_1based"] + 1)
+        overlap_start = max(int(left["start_1based"]), int(right["start_1based"]))
+        overlap_end = min(int(left["end_1based"]), int(right["end_1based"]))
+        overlap = int(overlap_end - overlap_start + 1)
+        if overlap <= 0:
+            overlap_start = None
+            overlap_end = None
+        snp_count = count_snps_in_interval(common_snps, str(left["chrom"]), overlap_start, overlap_end)
+        snp_density = None
+        if snp_count is not None and overlap > 0:
+            snp_density = round((snp_count / overlap) * 1000, 6)
         if min_overlap is None or overlap < min_overlap:
             min_overlap = overlap
-        bad.append({
+        rows.append({
             "left_tile_id": int(left["tile_id"]),
             "right_tile_id": int(right["tile_id"]),
+            "chrom": str(left["chrom"]),
+            "overlap_start_1based": overlap_start,
+            "overlap_end_1based": overlap_end,
+            "overlap_start_0based": None if overlap_start is None else int(overlap_start) - 1,
+            "overlap_end_0based": overlap_end,
+            "overlap_length_bp": overlap,
             "overlap_bp": overlap,
+            "overlap_snp_count": snp_count,
+            "overlap_snp_density_per_kb": snp_density,
         })
-    return (min_overlap if min_overlap is not None else 0), bad
+    return (min_overlap if min_overlap is not None else 0), rows
 
 
 def same_pool_overlap_metrics(tiles: pd.DataFrame):
@@ -219,7 +294,12 @@ def same_pool_overlap_metrics(tiles: pd.DataFrame):
     return int(max_overlap), hits
 
 
-def evaluate_candidate(selected_pairs_path: Path, merged_tiles: pd.DataFrame, args: argparse.Namespace) -> dict:
+def evaluate_candidate(
+    selected_pairs_path: Path,
+    merged_tiles: pd.DataFrame,
+    args: argparse.Namespace,
+    common_snps: Optional[pd.DataFrame] = None,
+) -> dict:
     tiles = standardize_tile_plan(merged_tiles)
     selected = pd.read_csv(selected_pairs_path, sep="\t") if Path(selected_pairs_path).exists() else pd.DataFrame()
     if "tile_id" in selected.columns:
@@ -244,8 +324,22 @@ def evaluate_candidate(selected_pairs_path: Path, merged_tiles: pd.DataFrame, ar
     min_pair_score = float(pd.to_numeric(selected[pair_score_col], errors="coerce").min()) if pair_score_col and not selected.empty else 0.0
     min_offtarget_score = float(pd.to_numeric(selected[min_off_col], errors="coerce").min()) if min_off_col and not selected.empty else 0.0
 
-    min_overlap, overlap_rows = adjacent_overlap_metrics(tiles)
+    min_overlap, overlap_rows = adjacent_overlap_metrics(tiles, common_snps)
     bad_adjacent = [r for r in overlap_rows if r["overlap_bp"] < args.min_overlap_bp]
+    overlap_snp_counts = [
+        int(r["overlap_snp_count"])
+        for r in overlap_rows
+        if r.get("overlap_snp_count") is not None and not pd.isna(r.get("overlap_snp_count"))
+    ]
+    overlaps_lacking_snps = [
+        r
+        for r in overlap_rows
+        if r.get("overlap_snp_count") is not None
+        and not pd.isna(r.get("overlap_snp_count"))
+        and int(r["overlap_snp_count"]) < args.min_overlap_snp_count
+    ]
+    min_overlap_snp_count = min(overlap_snp_counts) if overlap_snp_counts else None
+    total_overlap_snp_count = sum(overlap_snp_counts) if overlap_snp_counts else 0
     max_same_pool_overlap, same_pool_rows = same_pool_overlap_metrics(tiles)
     size_violations = int(((tiles["end_1based"] - tiles["start_1based"] + 1) > args.max_tile_size_bp).sum())
     n_same_pool_overlaps = int(len(same_pool_rows))
@@ -255,10 +349,12 @@ def evaluate_candidate(selected_pairs_path: Path, merged_tiles: pd.DataFrame, ar
     score -= 1500.0 * n_missing
     score -= 1200.0 * n_unacceptable
     score -= 800.0 * len(bad_adjacent)
+    score -= 350.0 * len(overlaps_lacking_snps)
     score -= 500.0 * size_violations
     score -= 5000.0 * n_same_pool_overlaps
     score += 0.5 * min_pair_score
     score += 0.25 * min_overlap
+    score += 25.0 * total_overlap_snp_count
 
     return {
         "n_tiles": int(len(tiles)),
@@ -271,6 +367,11 @@ def evaluate_candidate(selected_pairs_path: Path, merged_tiles: pd.DataFrame, ar
         "min_adjacent_overlap_bp": int(min_overlap),
         "n_bad_adjacent_overlaps": int(len(bad_adjacent)),
         "bad_adjacent_overlaps": json.dumps(bad_adjacent),
+        "min_overlap_snp_count": min_overlap_snp_count,
+        "total_overlap_snp_count": int(total_overlap_snp_count),
+        "n_overlaps_lacking_common_snps": int(len(overlaps_lacking_snps)),
+        "overlaps_lacking_common_snps": json.dumps(overlaps_lacking_snps),
+        "overlap_snp_metrics": json.dumps(overlap_rows),
         "n_same_pool_overlaps": int(n_same_pool_overlaps),
         "max_same_pool_overlap_bp": int(max_same_pool_overlap),
         "same_pool_overlaps": json.dumps(same_pool_rows),
@@ -511,6 +612,7 @@ def iterative_redesign(args: argparse.Namespace) -> int:
 
     current_tiles = standardize_tile_plan(pd.read_csv(args.tile_plan_tsv, sep="\t"))
     current_selected_path = Path(args.selected_pairs_tsv)
+    common_snps = load_common_snps_bed(Path(args.common_snps_bed) if args.common_snps_bed else None)
 
     all_eval_rows = []
     all_candidate_tile_rows = []
@@ -531,11 +633,16 @@ def iterative_redesign(args: argparse.Namespace) -> int:
         round_dir.mkdir(parents=True, exist_ok=True)
         current_tiles_path = round_dir / "current_tile_plan.tsv"
         current_tiles.to_csv(current_tiles_path, sep="\t", index=False)
+        _, current_overlap_rows = adjacent_overlap_metrics(current_tiles, common_snps)
+        current_overlaps_path = round_dir / "current_tile_overlaps.tsv"
+        pd.DataFrame(current_overlap_rows).to_csv(current_overlaps_path, sep="\t", index=False)
         print(f"[ROUND] {rnd}/{args.max_redesign_rounds}", flush=True)
 
         detect_dir = round_dir / "09a_detect"
         cmd09a = [py, str(scripts / "09a_detect_problematic_tiles.py"), "--selected-pairs-tsv", str(current_selected_path), "--tile-plan-tsv", str(current_tiles_path), "--outdir", str(detect_dir), "--max-fragment-length-bp", str(args.max_tile_size_bp)]
-        if args.tile_overlaps_tsv:
+        if current_overlaps_path.exists():
+            cmd09a += ["--tile-overlaps-tsv", str(current_overlaps_path)]
+        elif args.tile_overlaps_tsv:
             cmd09a += ["--tile-overlaps-tsv", args.tile_overlaps_tsv]
         run(cmd09a, quiet=not args.show_substep_output)
 
@@ -583,7 +690,7 @@ def iterative_redesign(args: argparse.Namespace) -> int:
                 selected_path = rerun_pipeline(plan_path, rerun_dir, args, quiet=not args.show_substep_output)
                 plan_std = standardize_tile_plan(plan_df)
                 plan_std.to_csv(rerun_dir / "candidate_tile_plan.standardized.tsv", sep="\t", index=False)
-                metrics = evaluate_candidate(selected_path, plan_std, args)
+                metrics = evaluate_candidate(selected_path, plan_std, args, common_snps=common_snps)
                 metrics.update({"round": rnd, "candidate_plan_id": pid, "strategy": strategy, "strategy_details": details})
                 round_results.append(metrics)
                 all_eval_rows.append(metrics)

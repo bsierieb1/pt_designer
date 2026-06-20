@@ -7,7 +7,8 @@ import pandas as pd
 
 LOCAL = {
     'no_selected_pair','poor_offtarget_options','poor_ontarget_options','guides_far_from_boundaries',
-    'guide_overlaps_common_snp'
+    'guide_overlaps_common_snp','guide_low_complexity_warning','guide_homopolymer_warning',
+    'guide_sequence_warning'
 }
 LONG = {'no_selected_pair','poor_offtarget_options','guide_has_exact_in_locus_offtarget'}
 
@@ -41,6 +42,19 @@ def safe_bool(v):
     if isinstance(v, bool):
         return v
     return str(v).strip().lower() in {'1','true','t','yes','y'}
+
+def first_numeric(row, names, default=0):
+    for name in names:
+        if name not in row.index:
+            continue
+        val = row.get(name)
+        if pd.isna(val):
+            continue
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            continue
+    return default
 
 def trigger(reasons, severity, block_size, pair_found):
     rs = set(reasons)
@@ -101,7 +115,7 @@ def main():
         lcol = choose_col(overlaps, ['left_tile_id','tile_left','tile1_id','tile_1_id'])
         rcol = choose_col(overlaps, ['right_tile_id','tile_right','tile2_id','tile_2_id'])
         olen = choose_col(overlaps, ['overlap_length_bp','overlap_bp','length_bp'])
-        osnp = choose_col(overlaps, ['n_common_snps_in_overlap','n_common_snps','common_snp_count'])
+        osnp = choose_col(overlaps, ['overlap_snp_count','n_common_snps_in_overlap','n_common_snps','common_snp_count'])
         if lcol and rcol and olen:
             for _, r in overlaps.iterrows():
                 overlap_map[str(r[lcol])] = {
@@ -130,8 +144,12 @@ def main():
             if min_off < a.min_offtarget_score: reasons.append('poor_offtarget_options')
             if min_on < a.min_ontarget_score: reasons.append('poor_ontarget_options')
             if int(chosen.get('pair_total_common_snp_overlaps', 0)) > 0: reasons.append('guide_overlaps_common_snp')
-            if int(chosen.get('pair_total_low_complexity_flags', 0)) > 0: reasons.append('guide_low_complexity_warning')
-            if int(chosen.get('pair_total_homopolymer_flags', 0)) > 0: reasons.append('guide_homopolymer_warning')
+            basic_warnings = first_numeric(chosen, ['pair_total_basic_sequence_warnings','pair_n_basic_sequence_warnings'])
+            low_complexity_warnings = first_numeric(chosen, ['pair_total_low_complexity_flags','pair_n_low_complexity_guides'])
+            homopolymer_warnings = first_numeric(chosen, ['pair_total_homopolymer_flags','pair_n_homopolymer_guides'])
+            if basic_warnings > 0: reasons.append('guide_sequence_warning')
+            if low_complexity_warnings > 0: reasons.append('guide_low_complexity_warning')
+            if homopolymer_warnings > 0: reasons.append('guide_homopolymer_warning')
             if bad_dist > 2 * a.max_boundary_distance_bp: reasons.append('guides_far_from_boundaries')
             if safe_bool(chosen.get('pair_has_exact_in_locus_offtarget', False)): reasons.append('guide_has_exact_in_locus_offtarget')
             if reasons:
@@ -164,6 +182,9 @@ def main():
             'pair_min_offtarget_score': None if chosen is None else chosen.get('pair_min_offtarget_score', chosen.get('offtarget_score')),
             'pair_total_distance_abs_to_boundary_bp': None if chosen is None else chosen.get('pair_total_distance_abs_to_boundary_bp'),
             'pair_total_common_snp_overlaps': None if chosen is None else chosen.get('pair_total_common_snp_overlaps'),
+            'pair_n_basic_sequence_warnings': None if chosen is None else first_numeric(chosen, ['pair_total_basic_sequence_warnings','pair_n_basic_sequence_warnings']),
+            'pair_n_low_complexity_guides': None if chosen is None else first_numeric(chosen, ['pair_total_low_complexity_flags','pair_n_low_complexity_guides']),
+            'pair_n_homopolymer_guides': None if chosen is None else first_numeric(chosen, ['pair_total_homopolymer_flags','pair_n_homopolymer_guides']),
             'pair_total_repeat_overlaps': None if chosen is None else chosen.get('pair_total_repeat_overlaps'),
             'pair_total_segdup_overlaps': None if chosen is None else chosen.get('pair_total_segdup_overlaps'),
             'pair_has_exact_in_locus_offtarget': False if chosen is None else safe_bool(chosen.get('pair_has_exact_in_locus_offtarget', False)),
