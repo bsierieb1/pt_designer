@@ -158,14 +158,11 @@ def render_simple_html(context: dict) -> str:
 <h1>PacBio PureTarget design summary</h1>
 <div class='box'>
 <p><strong>Locus:</strong> {context.get('locus_label', 'NA')}<br>
-<strong>Final tiles:</strong> {context.get('n_tiles', 0)}<br>
-<strong>Odd pool tiles:</strong> {context.get('n_odd', 0)}<br>
-<strong>Even pool tiles:</strong> {context.get('n_even', 0)}</p>
+<strong>Final tiles:</strong> {context.get('n_tiles', 0)}{context.get('pool_counts_html', '')}</p>
 {context.get('design_search_link_html', '')}
 </div>
 
-<h2>Pool summary</h2>
-{context.get('pool_table_html', '<p><em>None</em></p>')}
+{context.get('pool_summary_section_html', '')}
 
 <h2>Final selected pairs</h2>
 {context.get('tiles_table_html', '<p><em>None</em></p>')}
@@ -205,11 +202,12 @@ def render_simple_html(context: dict) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description='Generate human-readable design report.')
     ap.add_argument('--selected-pairs-final-tsv', required=True)
-    ap.add_argument('--tile-pool-assignment-tsv', required=True)
+    ap.add_argument('--tile-pool-assignment-tsv', required=False)
     ap.add_argument('--guides-for-ordering-csv', required=False)
     ap.add_argument('--tiles-problematic-tsv', required=False)
     ap.add_argument('--locus-json', required=False)
     ap.add_argument('--design-search-dir', required=False, help='Directory containing Step 9 search-history outputs')
+    ap.add_argument('--unpooled', action='store_true', help='Render report without odd/even pool labels.')
     ap.add_argument('--outdir', required=True)
     args = ap.parse_args()
 
@@ -217,8 +215,12 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     selected = pd.read_csv(args.selected_pairs_final_tsv, sep='\t')
-    pools = pd.read_csv(args.tile_pool_assignment_tsv, sep='\t')
-    df = selected.merge(pools[['tile_id', 'pool', 'pool_label']], on='tile_id', how='left')
+    use_pools = bool(args.tile_pool_assignment_tsv) and not args.unpooled
+    if use_pools:
+        pools = pd.read_csv(args.tile_pool_assignment_tsv, sep='\t')
+        df = selected.merge(pools[['tile_id', 'pool', 'pool_label']], on='tile_id', how='left')
+    else:
+        df = selected.copy()
 
     guides = pd.read_csv(args.guides_for_ordering_csv) if args.guides_for_ordering_csv and Path(args.guides_for_ordering_csv).exists() else pd.DataFrame()
     problems = pd.read_csv(args.tiles_problematic_tsv, sep='\t') if args.tiles_problematic_tsv and Path(args.tiles_problematic_tsv).exists() else pd.DataFrame()
@@ -229,11 +231,21 @@ def main() -> int:
             locus = json.load(fh)
         locus_label = locus.get('locus', locus.get('region', 'NA'))
 
-    pool_table = (
-        df.groupby('pool', dropna=False)
-        .agg(n_tiles=('tile_id', 'count'), mean_pair_score=('pair_score', 'mean'))
-        .reset_index()
-    )
+    if use_pools:
+        pool_table = (
+            df.groupby('pool', dropna=False)
+            .agg(n_tiles=('tile_id', 'count'), mean_pair_score=('pair_score', 'mean'))
+            .reset_index()
+        )
+        pool_counts_html = (
+            f"<br><strong>Odd pool tiles:</strong> {int((df['pool'] == 'odd').sum())}"
+            f"<br><strong>Even pool tiles:</strong> {int((df['pool'] == 'even').sum())}"
+        )
+        pool_summary_section_html = f"<h2>Pool summary</h2>{table_html(pool_table, max_rows=10)}"
+    else:
+        pool_table = pd.DataFrame()
+        pool_counts_html = ''
+        pool_summary_section_html = ''
 
     ontarget_hist = maybe_plot_multi_hist(
         [df[c] for c in ['left_ontarget_score', 'right_ontarget_score'] if c in df.columns],
@@ -289,9 +301,8 @@ def main() -> int:
     context = {
         'locus_label': locus_label,
         'n_tiles': int(len(df)),
-        'n_odd': int((df['pool'] == 'odd').sum()) if 'pool' in df.columns else 0,
-        'n_even': int((df['pool'] == 'even').sum()) if 'pool' in df.columns else 0,
-        'pool_table_html': table_html(pool_table, max_rows=10),
+        'pool_counts_html': pool_counts_html,
+        'pool_summary_section_html': pool_summary_section_html,
         'tiles_table_html': table_html(df, max_rows=30),
         'guides_table_html': table_html(guides, max_rows=40),
         'problems_table_html': table_html(problems, max_rows=30),

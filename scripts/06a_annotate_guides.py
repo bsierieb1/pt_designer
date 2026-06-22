@@ -30,6 +30,18 @@ def parse_args() -> argparse.Namespace:
         help="Output directory.",
     )
     parser.add_argument(
+        "--avoid-targets-tsv",
+        required=False,
+        default=None,
+        help="Optional normalized hotspot targets TSV. Guides closer than --min-distance-to-target-bp are flagged.",
+    )
+    parser.add_argument(
+        "--min-distance-to-target-bp",
+        type=int,
+        default=50,
+        help="Minimum required distance between guide+PAM footprint and any hotspot target. Default: 50",
+    )
+    parser.add_argument(
         "--homopolymer-threshold",
         type=int,
         default=4,
@@ -116,6 +128,28 @@ def load_bed(path: Optional[Path], source_name: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def load_targets(path: Optional[Path]) -> pd.DataFrame:
+    cols = ["target_id", "chrom", "start_1based", "end_1based", "label"]
+    if path is None or not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame(columns=cols)
+
+    df = pd.read_csv(path, sep="\t")
+    required = ["target_id", "chrom", "start_1based", "end_1based"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Hotspot targets TSV missing required columns: {missing}")
+
+    out = df.copy()
+    out["target_id"] = pd.to_numeric(out["target_id"], errors="coerce").astype(int)
+    out["chrom"] = out["chrom"].astype(str).str.strip().map(lambda x: x if x.startswith("chr") else f"chr{x}")
+    out["start_1based"] = pd.to_numeric(out["start_1based"], errors="coerce").astype(int)
+    out["end_1based"] = pd.to_numeric(out["end_1based"], errors="coerce").astype(int)
+    if "label" not in out.columns:
+        out["label"] = out["target_id"].map(lambda x: f"target_{x}")
+    out["label"] = out["label"].fillna("").astype(str)
+    return out[cols].reset_index(drop=True)
+
+
 def gc_fraction(seq: str) -> float:
     seq = seq.upper()
     atgc = sum(1 for b in seq if b in {"A", "C", "G", "T"})
@@ -180,6 +214,66 @@ def count_overlaps(
     return pd.Series(counts, index=candidates.index)
 
 
+def interval_distance_bp(start_a: int, end_a: int, start_b: int, end_b: int) -> int:
+    if end_a < start_b:
+        return max(0, start_b - end_a - 1)
+    if end_b < start_a:
+        return max(0, start_a - end_b - 1)
+    return 0
+
+
+def annotate_target_distance(
+    candidates: pd.DataFrame,
+    targets: pd.DataFrame,
+    min_distance_to_target_bp: int,
+) -> pd.DataFrame:
+    out = candidates.copy()
+    out["nearest_target_distance_bp"] = pd.NA
+    out["nearest_target_id"] = ""
+    out["nearest_target_label"] = ""
+    out["guide_too_close_to_target"] = False
+
+    if out.empty or targets.empty:
+        return out
+
+    distances = []
+    target_ids = []
+    target_labels = []
+    too_close = []
+
+    for _, row in out.iterrows():
+        chrom = str(row["chrom"])
+        guide_start = int(row["guide_plus_pam_start_0based"]) + 1
+        guide_end = int(row["guide_plus_pam_end_0based"])
+        sub = targets[targets["chrom"] == chrom]
+
+        best_distance = None
+        best_id = ""
+        best_label = ""
+        for _, target in sub.iterrows():
+            dist = interval_distance_bp(
+                guide_start,
+                guide_end,
+                int(target["start_1based"]),
+                int(target["end_1based"]),
+            )
+            if best_distance is None or dist < best_distance:
+                best_distance = dist
+                best_id = str(int(target["target_id"]))
+                best_label = str(target.get("label", ""))
+
+        distances.append(best_distance if best_distance is not None else pd.NA)
+        target_ids.append(best_id)
+        target_labels.append(best_label)
+        too_close.append(best_distance is not None and best_distance < min_distance_to_target_bp)
+
+    out["nearest_target_distance_bp"] = distances
+    out["nearest_target_id"] = target_ids
+    out["nearest_target_label"] = target_labels
+    out["guide_too_close_to_target"] = too_close
+    return out
+
+
 def annotate_sequence_qc(
     df: pd.DataFrame,
     homopolymer_threshold: int,
@@ -206,6 +300,7 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         {"metric": "n_low_complexity", "value": int(df["is_low_complexity"].sum())},
         {"metric": "n_gc_too_low", "value": int(df["gc_too_low"].sum())},
         {"metric": "n_gc_too_high", "value": int(df["gc_too_high"].sum())},
+        {"metric": "n_too_close_to_target", "value": int(df.get("guide_too_close_to_target", pd.Series(False, index=df.index)).sum())},
     ]
     return pd.DataFrame(rows)
 
@@ -222,6 +317,7 @@ def summarize_by_tile_boundary(df: pd.DataFrame) -> pd.DataFrame:
                 "n_overlap_common_snp": int(sub["n_common_snp_overlaps"].gt(0).sum()),
                 "n_has_homopolymer": int(sub["has_homopolymer"].sum()),
                 "n_low_complexity": int(sub["is_low_complexity"].sum()),
+                "n_too_close_to_target": int(sub.get("guide_too_close_to_target", pd.Series(False, index=sub.index)).sum()),
                 "best_min_distance_bp": int(sub["distance_abs_to_boundary_bp"].min()),
             }
         )
@@ -236,6 +332,7 @@ def main() -> int:
 
     candidates = load_candidates(Path(args.candidates_oriented_tsv))
     common_snps = load_bed(Path(args.common_snps_bed), "common_snps") if args.common_snps_bed else load_bed(None, "common_snps")
+    avoid_targets = load_targets(Path(args.avoid_targets_tsv)) if args.avoid_targets_tsv else load_targets(None)
 
     annotated = candidates.copy()
     annotated["pam_start_0based"] = annotated["pam_start_1based"].astype(int) - 1
@@ -250,6 +347,11 @@ def main() -> int:
         end_col="guide_plus_pam_end_0based",
     ).astype(int)
     annotated["overlaps_common_snp"] = annotated["n_common_snp_overlaps"] > 0
+    annotated = annotate_target_distance(
+        annotated,
+        avoid_targets,
+        min_distance_to_target_bp=args.min_distance_to_target_bp,
+    )
 
     annotated["n_repeat_overlaps"] = 0
     annotated["overlaps_repeat"] = False

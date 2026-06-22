@@ -24,6 +24,9 @@ def collect_warnings(row) -> str:
         ("right_has_homopolymer", "right_homopolymer"),
         ("left_is_low_complexity", "left_low_complexity"),
         ("right_is_low_complexity", "right_low_complexity"),
+        ("left_guide_too_close_to_target", "left_near_target"),
+        ("right_guide_too_close_to_target", "right_near_target"),
+        ("pair_has_guide_too_close_to_target", "guide_near_target"),
     ]:
         if col in row.index and bool(row[col]):
             warnings.append(label)
@@ -51,7 +54,8 @@ def write_fasta(df: pd.DataFrame, path: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate final guide ordering table.")
     ap.add_argument("--selected-pairs-final-tsv", required=True)
-    ap.add_argument("--tile-pool-assignment-tsv", required=True)
+    ap.add_argument("--tile-pool-assignment-tsv", required=False)
+    ap.add_argument("--unpooled", action="store_true", help="Write one combined guide table/FASTA without pool labels.")
     ap.add_argument("--outdir", required=True)
     args = ap.parse_args()
 
@@ -59,8 +63,12 @@ def main() -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     pairs = pd.read_csv(args.selected_pairs_final_tsv, sep="\t")
-    pools = pd.read_csv(args.tile_pool_assignment_tsv, sep="\t")
-    df = pairs.merge(pools[["tile_id", "pool", "pool_label"]], on="tile_id", how="left")
+    use_pools = bool(args.tile_pool_assignment_tsv) and not args.unpooled
+    if use_pools:
+        pools = pd.read_csv(args.tile_pool_assignment_tsv, sep="\t")
+        df = pairs.merge(pools[["tile_id", "pool", "pool_label"]], on="tile_id", how="left")
+    else:
+        df = pairs.copy()
 
     left_guide = first_existing(df, ["left_guide_seq", "left_guide", "guide_seq_left"], required=False)
     right_guide = first_existing(df, ["right_guide_seq", "right_guide", "guide_seq_right"], required=False)
@@ -75,12 +83,19 @@ def main() -> int:
 
     rows = []
     for _, row in df.iterrows():
-        common = {
-            "tile_id": row["tile_id"],
-            "pool": row.get("pool", ""),
-            "pair_score": row.get("pair_score", ""),
-            "warnings": collect_warnings(row),
-        }
+        if use_pools:
+            common = {
+                "tile_id": row["tile_id"],
+                "pool": row.get("pool", ""),
+                "pair_score": row.get("pair_score", ""),
+                "warnings": collect_warnings(row),
+            }
+        else:
+            common = {
+                "tile_id": row["tile_id"],
+                "pair_score": row.get("pair_score", ""),
+                "warnings": collect_warnings(row),
+            }
         if left_guide:
             rows.append({
                 **common,
@@ -104,12 +119,18 @@ def main() -> int:
 
     out = pd.DataFrame(rows)
     out.to_csv(outdir / "guides_for_ordering.csv", index=False)
-    write_fasta(out[out["pool"] == "odd"], outdir / "guides_odd.fasta")
-    write_fasta(out[out["pool"] == "even"], outdir / "guides_even.fasta")
+    if use_pools:
+        write_fasta(out[out["pool"] == "odd"], outdir / "guides_odd.fasta")
+        write_fasta(out[out["pool"] == "even"], outdir / "guides_even.fasta")
+    else:
+        write_fasta(out, outdir / "guides.fasta")
 
     print(f"[DONE] Wrote {outdir / 'guides_for_ordering.csv'}")
-    print(f"[DONE] Wrote {outdir / 'guides_odd.fasta'}")
-    print(f"[DONE] Wrote {outdir / 'guides_even.fasta'}")
+    if use_pools:
+        print(f"[DONE] Wrote {outdir / 'guides_odd.fasta'}")
+        print(f"[DONE] Wrote {outdir / 'guides_even.fasta'}")
+    else:
+        print(f"[DONE] Wrote {outdir / 'guides.fasta'}")
     return 0
 
 

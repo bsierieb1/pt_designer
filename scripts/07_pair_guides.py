@@ -107,6 +107,8 @@ SAFE_BONUS_CLASSES = {'ideal', 'good'}
 def classify_pair(row: pd.Series) -> str:
     if row.get('pair_has_exact_in_locus_offtarget', False):
         return 'unacceptable'
+    if row.get('pair_has_guide_too_close_to_target', False):
+        return 'unacceptable'
     if row['pair_has_common_snp_overlap']:
         return 'unacceptable'
     if row['pair_min_ontarget_score'] >= 55 and row['pair_min_offtarget_score'] >= 70 and row['pair_total_warnings'] == 0:
@@ -127,6 +129,7 @@ def compute_pair_score(row: pd.Series) -> float:
     score -= 4.0 * float(row['pair_total_distance_abs_to_boundary_bp'])
     score -= 6.0 * float(row['pair_total_warnings'])
     score -= 120.0 * float(row.get('pair_has_exact_in_locus_offtarget', False))
+    score -= 120.0 * float(row.get('pair_has_guide_too_close_to_target', False))
     score -= 40.0 * float(row['pair_has_common_snp_overlap'])
 
     if row['left_design_class'] in SAFE_BONUS_CLASSES and row['right_design_class'] in SAFE_BONUS_CLASSES:
@@ -167,6 +170,10 @@ GUIDE_EXPORT_COLUMNS = [
     'has_exact_in_locus_offtarget',
     'n_exact_in_locus_offtargets',
     'exact_in_locus_offtarget_sites',
+    'guide_too_close_to_target',
+    'nearest_target_distance_bp',
+    'nearest_target_id',
+    'nearest_target_label',
 ]
 
 
@@ -213,6 +220,7 @@ def build_pairs(df: pd.DataFrame) -> pd.DataFrame:
         ('is_low_complexity', 'pair_n_low_complexity_guides'),
         ('overlaps_common_snp', 'pair_n_guides_overlapping_common_snp'),
         ('has_exact_in_locus_offtarget', 'pair_n_guides_with_exact_in_locus_offtarget'),
+        ('guide_too_close_to_target', 'pair_n_guides_too_close_to_target'),
         ('overlaps_repeat', 'pair_n_guides_overlapping_repeat'),
         ('overlaps_segdup', 'pair_n_guides_overlapping_segdup'),
     ]:
@@ -247,6 +255,7 @@ def build_pairs(df: pd.DataFrame) -> pd.DataFrame:
 
     pairs['pair_has_common_snp_overlap'] = pairs['pair_total_common_snp_overlaps'] > 0
     pairs['pair_has_exact_in_locus_offtarget'] = pairs['pair_total_exact_in_locus_offtargets'] > 0
+    pairs['pair_has_guide_too_close_to_target'] = pairs['pair_n_guides_too_close_to_target'] > 0
     pairs['pair_has_repeat_overlap'] = pairs['pair_total_repeat_overlaps'] > 0
     pairs['pair_has_segdup_overlap'] = pairs['pair_total_segdup_overlaps'] > 0
 

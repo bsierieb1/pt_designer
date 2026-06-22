@@ -17,7 +17,9 @@ import streamlit as st
 
 @dataclass
 class RunResult:
+    mode: str
     run_dir: Path
+    guides_path: Optional[Path]
     guides_even_path: Path
     guides_odd_path: Path
     guide_order_table_path: Path
@@ -29,6 +31,10 @@ class RunResult:
 APP_TITLE = "PureTarget designer"
 DEFAULT_OUTROOT = "streamlit_runs"
 LOCUS_RE = re.compile(r"^(chr[\w]+):(\d[\d,]*)-(\d[\d,]*)$")
+REGION_TOKEN_RE = re.compile(r"^(chr[\w]+):(\d[\d,]*)-(\d[\d,]*)$")
+HOTSPOT_EXAMPLE = """chr9\t108874893\t108874894\tELP1:c.3931+1G>T
+chr9\t108878680\t108878681\tELP1:c.3643dupG
+chr9\t108878730\t108878731\tELP1:c.3592C>T"""
 
 
 def quote_cmd(parts: List[str]) -> str:
@@ -189,6 +195,83 @@ def validate_locus_syntax(locus: str) -> str:
 
     return f"{m.group(1)}:{start}-{end}"
 
+
+def _parse_coord_value(text: str) -> int:
+    return int(str(text).replace(",", ""))
+
+
+def parse_hotspot_targets_text(targets_text: str, coordinate_system: str) -> pd.DataFrame:
+    rows = []
+    for raw_line in targets_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = line.split()
+        chrom = None
+        start = None
+        end = None
+        label = ""
+
+        m = REGION_TOKEN_RE.match(parts[0]) if parts else None
+        if m:
+            chrom = m.group(1)
+            start = _parse_coord_value(m.group(2))
+            end = _parse_coord_value(m.group(3))
+            label = " ".join(parts[1:])
+        elif len(parts) >= 3:
+            chrom = parts[0]
+            start = _parse_coord_value(parts[1])
+            end = _parse_coord_value(parts[2])
+            label = " ".join(parts[3:])
+
+        if chrom is None or start is None or end is None:
+            raise ValueError(f"Could not parse hotspot target line: {raw_line}")
+        if not str(chrom).startswith("chr"):
+            raise ValueError(f"Hotspot target chromosome must start with chr: {raw_line}")
+
+        if coordinate_system == "0based":
+            if end <= start:
+                raise ValueError(f"0-based half-open target must have end > start: {raw_line}")
+            start_1based = start + 1
+            end_1based = end
+        else:
+            if end < start:
+                raise ValueError(f"1-based inclusive target must have end >= start: {raw_line}")
+            start_1based = start
+            end_1based = end
+
+        rows.append(
+            {
+                "target_id": len(rows) + 1,
+                "chrom": chrom,
+                "input_start": start,
+                "input_end": end,
+                "coordinate_system": coordinate_system,
+                "start_1based": start_1based,
+                "end_1based": end_1based,
+                "label": label or f"target_{len(rows) + 1}",
+                "input_line": raw_line,
+            }
+        )
+
+    if not rows:
+        raise ValueError("Hotspot mode requires at least one target region.")
+
+    df = pd.DataFrame(rows)
+    if df["chrom"].nunique() != 1:
+        raise ValueError("Hotspot mode currently requires all target regions to be on one chromosome.")
+    df = df.sort_values(["chrom", "start_1based", "end_1based", "target_id"]).reset_index(drop=True)
+    df["target_id"] = range(1, len(df) + 1)
+    return df
+
+
+def hotspot_locus_from_targets(targets_df: pd.DataFrame) -> str:
+    chrom = str(targets_df["chrom"].iloc[0])
+    start = int(targets_df["start_1based"].min())
+    end = int(targets_df["end_1based"].max())
+    return f"{chrom}:{start}-{end}"
+
 def ensure_path(path_text: str, kind: str) -> Path:
     path = Path(path_text).expanduser().resolve()
     if kind == "file" and not path.is_file():
@@ -201,11 +284,14 @@ def ensure_path(path_text: str, kind: str) -> Path:
 def build_commands(
     scripts_dir: Path,
     run_dir: Path,
+    design_mode: str,
     locus: str,
     target_tile_size: int,
     min_tile_size: int,
     max_tile_size: int,
     force_single_tile: bool,
+    hotspot_targets_tsv: Optional[Path] = None,
+    min_tile_gap_bp: int = 500,
 ) -> List[List[str]]:
     py = sys.executable
 
@@ -217,6 +303,91 @@ def build_commands(
         "--outdir",
         str(run_dir),
     ]
+
+    if design_mode == "hotspot":
+        if hotspot_targets_tsv is None:
+            raise ValueError("Hotspot mode requires a normalized target TSV.")
+
+        step02b = [
+            py,
+            str(scripts_dir / "02b_make_hotspot_tiles.py"),
+            "--targets-tsv",
+            str(hotspot_targets_tsv),
+            "--locus-json",
+            str(run_dir / "01_locus_annotation" / "locus.json"),
+            "--outdir",
+            str(run_dir / "02_tiles"),
+            "--target-tile-size",
+            str(target_tile_size),
+            "--max-tile-size",
+            str(max_tile_size),
+            "--min-tile-gap-bp",
+            str(min_tile_gap_bp),
+        ]
+
+        step09h = [
+            py,
+            str(scripts_dir / "09h_optimize_hotspot_plans.py"),
+            "--candidate-plans-tsv",
+            str(run_dir / "02_tiles" / "candidate_plans_summary.tsv"),
+            "--tile-plan-candidates-tsv",
+            str(run_dir / "02_tiles" / "tile_plan_candidates.tsv"),
+            "--targets-tsv",
+            str(hotspot_targets_tsv),
+            "--locus-json",
+            str(run_dir / "01_locus_annotation" / "locus.json"),
+            "--scripts-dir",
+            str(scripts_dir),
+            "--base-output-dir",
+            str(run_dir),
+            "--common-snps-bed",
+            str(run_dir / "01_locus_annotation" / "common_snps.bed"),
+            "--ucsc-cache-dir",
+            str(run_dir / "ucsc_cache"),
+            "--max-tile-size-bp",
+            str(max_tile_size),
+            "--min-tile-gap-bp",
+            str(min_tile_gap_bp),
+            "--min-guide-target-distance-bp",
+            "50",
+        ]
+
+        selected_final = run_dir / "09h_hotspot_optimization" / "selected_pairs_final.tsv"
+        design_search_dir = run_dir / "09h_hotspot_optimization" / "search_history"
+
+        step11a = [
+            py,
+            str(scripts_dir / "11a_generate_final_guide_order_table.py"),
+            "--selected-pairs-final-tsv",
+            str(selected_final),
+            "--unpooled",
+            "--outdir",
+            str(run_dir / "11_deliverables"),
+        ]
+
+        step11c = [
+            py,
+            str(scripts_dir / "11c_generate_human_readable_report.py"),
+            "--selected-pairs-final-tsv",
+            str(selected_final),
+            "--guides-for-ordering-csv",
+            str(run_dir / "11_deliverables" / "guides_for_ordering.csv"),
+            "--locus-json",
+            str(run_dir / "01_locus_annotation" / "locus.json"),
+            "--design-search-dir",
+            str(design_search_dir),
+            "--unpooled",
+            "--outdir",
+            str(run_dir / "11_deliverables"),
+        ]
+
+        return [
+            step01,
+            step02b,
+            step09h,
+            step11a,
+            step11c,
+        ]
 
     step02 = [
         py,
@@ -430,24 +601,46 @@ def run_pipeline(
     repo_root: Path,
     scripts_dir: Path,
     out_root: Path,
-    locus: str,
+    design_mode: str,
+    locus: Optional[str],
     target_tile_size: int,
     min_tile_size: int,
     max_tile_size: int,
     force_single_tile: bool,
+    hotspot_targets_text: str,
+    hotspot_coordinate_system: str,
+    min_tile_gap_bp: int,
     progress_placeholder
 ) -> RunResult:
+    hotspot_targets_tsv: Optional[Path] = None
+    if design_mode == "hotspot":
+        targets_df = parse_hotspot_targets_text(hotspot_targets_text, hotspot_coordinate_system)
+        locus = hotspot_locus_from_targets(targets_df)
+    elif locus is None:
+        raise ValueError("Multi-tile mode requires locus coordinates.")
+
     run_name = locus.replace(":", "_").replace("-", "_").replace(",", "")
     tmp = tempfile.mkdtemp(prefix=f"ptd_{run_name}_", dir=str(out_root))
     run_dir = Path(tmp)
+
+    if design_mode == "hotspot":
+        hotspot_dir = run_dir / "00_hotspot_targets"
+        hotspot_dir.mkdir(parents=True, exist_ok=True)
+        targets_df.to_csv(hotspot_dir / "targets_normalized.tsv", sep="\t", index=False)
+        (hotspot_dir / "targets_input.txt").write_text(hotspot_targets_text, encoding="utf-8")
+        hotspot_targets_tsv = hotspot_dir / "targets_normalized.tsv"
+
     commands = build_commands(
         scripts_dir=scripts_dir,
         run_dir=run_dir,
+        design_mode=design_mode,
         locus=locus,
         target_tile_size=target_tile_size,
         min_tile_size=min_tile_size,
         max_tile_size=max_tile_size,
         force_single_tile=force_single_tile,
+        hotspot_targets_tsv=hotspot_targets_tsv,
+        min_tile_gap_bp=min_tile_gap_bp,
     )
 
     logs: List[str] = []
@@ -467,13 +660,22 @@ def run_pipeline(
 
     progress_placeholder.progress(1.0, text="Done")
 
+    if design_mode == "hotspot":
+        round_summary_path = run_dir / "09h_hotspot_optimization" / "search_history" / "round_summary.tsv"
+        candidate_tiles_path = run_dir / "09h_hotspot_optimization" / "search_history" / "tile_plan_candidates_all_rounds.tsv"
+    else:
+        round_summary_path = run_dir / "09c_redesign_iterative" / "search_history" / "round_summary.tsv"
+        candidate_tiles_path = run_dir / "09c_redesign_iterative" / "search_history" / "tile_plan_candidates_all_rounds.tsv"
+
     result = RunResult(
+        mode=design_mode,
         run_dir=run_dir,
+        guides_path=run_dir / "11_deliverables" / "guides.fasta" if design_mode == "hotspot" else None,
         guides_even_path=run_dir / "11_deliverables" / "guides_even.fasta",
         guides_odd_path=run_dir / "11_deliverables" / "guides_odd.fasta",
         guide_order_table_path=run_dir / "11_deliverables" / "guides_for_ordering.csv",
-        round_summary_path=run_dir / "09c_redesign_iterative" / "search_history" / "round_summary.tsv",
-        candidate_tiles_path=run_dir / "09c_redesign_iterative" / "search_history" / "tile_plan_candidates_all_rounds.tsv",
+        round_summary_path=round_summary_path,
+        candidate_tiles_path=candidate_tiles_path,
         log_lines=logs,
     )
     return result
@@ -485,66 +687,95 @@ def show_result(result: RunResult):
     def _has_nonempty_file(path: Path) -> bool:
         return path.exists() and path.stat().st_size > 0
 
-    even_ready = _has_nonempty_file(result.guides_even_path)
-    odd_ready = _has_nonempty_file(result.guides_odd_path)
-
-    if even_ready and odd_ready:
-        col1, col2 = st.columns(2)
-        with col1:
+    if result.mode == "hotspot":
+        guides_ready = result.guides_path is not None and _has_nonempty_file(result.guides_path)
+        if guides_ready and result.guides_path is not None:
             st.download_button(
-                "Download guides_even.fasta",
-                data=read_bytes(str(result.guides_even_path)),
-                file_name="guides_even.fasta",
+                "Download guides.fasta",
+                data=read_bytes(str(result.guides_path)),
+                file_name="guides.fasta",
                 mime="text/plain",
+                use_container_width=True,
             )
-        with col2:
-            st.download_button(
-                "Download guides_odd.fasta",
-                data=read_bytes(str(result.guides_odd_path)),
-                file_name="guides_odd.fasta",
-                mime="text/plain",
-            )
-    elif odd_ready:
-        st.download_button(
-            "Download guides.fasta",
-            data=read_bytes(str(result.guides_odd_path)),
-            file_name="guides.fasta",
-            mime="text/plain",
-            use_container_width=True,
-        )
-    elif even_ready:
-        st.download_button(
-            "Download guides.fasta",
-            data=read_bytes(str(result.guides_even_path)),
-            file_name="guides.fasta",
-            mime="text/plain",
-            use_container_width=True,
-        )
+        else:
+            st.info("No FASTA guide file was produced.")
     else:
-        st.info("No FASTA guide file was produced.")
+        even_ready = _has_nonempty_file(result.guides_even_path)
+        odd_ready = _has_nonempty_file(result.guides_odd_path)
+
+        if even_ready and odd_ready:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "Download guides_even.fasta",
+                    data=read_bytes(str(result.guides_even_path)),
+                    file_name="guides_even.fasta",
+                    mime="text/plain",
+                )
+            with col2:
+                st.download_button(
+                    "Download guides_odd.fasta",
+                    data=read_bytes(str(result.guides_odd_path)),
+                    file_name="guides_odd.fasta",
+                    mime="text/plain",
+                )
+        elif odd_ready:
+            st.download_button(
+                "Download guides.fasta",
+                data=read_bytes(str(result.guides_odd_path)),
+                file_name="guides.fasta",
+                mime="text/plain",
+                use_container_width=True,
+            )
+        elif even_ready:
+            st.download_button(
+                "Download guides.fasta",
+                data=read_bytes(str(result.guides_even_path)),
+                file_name="guides.fasta",
+                mime="text/plain",
+                use_container_width=True,
+            )
+        else:
+            st.info("No FASTA guide file was produced.")
 
     st.subheader("Designed guides")
     guide_df = read_table(str(result.guide_order_table_path), sep=",")
     if guide_df.empty:
         st.info("No guide order table found.")
     else:
-        expected_cols = [
-            "Tile",
-            "Pool",
-            "Pair score",
-            "Warning",
-            "Tile flank",
-            "Sequence",
-            "Strand",
-            "Cut site",
-            "On-target score",
-            "Off-target score",
-        ]
+        if result.mode == "hotspot":
+            expected_cols = [
+                "Tile",
+                "Pair score",
+                "Warning",
+                "Tile flank",
+                "Sequence",
+                "Strand",
+                "Cut site",
+                "On-target score",
+                "Off-target score",
+            ]
+        else:
+            expected_cols = [
+                "Tile",
+                "Pool",
+                "Pair score",
+                "Warning",
+                "Tile flank",
+                "Sequence",
+                "Strand",
+                "Cut site",
+                "On-target score",
+                "Off-target score",
+            ]
         if len(guide_df.columns) == len(expected_cols):
             guide_df.columns = expected_cols
         st.dataframe(guide_df, use_container_width=True, hide_index=True)
 
-    st.subheader("Iterative redesign summary (if initial design attempt had issues)")
+    summary_title = "Hotspot plan optimization summary" if result.mode == "hotspot" else "Iterative redesign summary (if initial design attempt had issues)"
+    visualization_title = "Candidate tile plan visualization" if result.mode == "hotspot" else "Iterative redesign visualization"
+
+    st.subheader(summary_title)
     if result.round_summary_path and result.round_summary_path.exists():
         round_df = read_table(str(result.round_summary_path))
         needed_cols = ["round", "problematic_tiles", "accepted_candidate_plan_id", "accepted_score", "stop_reason"]
@@ -565,7 +796,7 @@ def show_result(result: RunResult):
     else:
         st.info("No round summary produced.")
 
-    st.subheader("Iterative redesign visualization")
+    st.subheader(visualization_title)
     if result.candidate_tiles_path and result.candidate_tiles_path.exists():
         fig = make_candidate_geometry_figure(str(result.candidate_tiles_path))
         if fig is None:
@@ -587,17 +818,51 @@ repo_root = Path.cwd().resolve()
 scripts_dir = (repo_root / "scripts").resolve()
 out_root = (repo_root / DEFAULT_OUTROOT).resolve()
 
-with st.form("run_form"):
-    locus = st.text_input("Locus coordinates, e.g. chr9:27545914-27573770", value="chr9:27545914-27573770")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        target_tile_size = st.number_input("Target tile size", min_value=1000, value=10000, step=500)
-    with c2:
-        min_tile_size = st.number_input("Min tile size", min_value=500, value=5000, step=500)
-    with c3:
-        max_tile_size = st.number_input("Max tile size", min_value=1000, value=12000, step=500)
+mode_label = st.radio(
+    "Design mode",
+    ["Multi-tile locus", "Hotspot / variant list"],
+    horizontal=True,
+    index=0,
+)
+design_mode = "hotspot" if mode_label.startswith("Hotspot") else "multi_tile"
 
-    force_single_tile = st.toggle("Toggle to disable multi-tile design", value=False)
+with st.form("run_form"):
+    locus: Optional[str] = None
+    hotspot_targets_text = ""
+    hotspot_coordinate_system = "1based"
+    min_tile_gap_bp = 500
+
+    if design_mode == "multi_tile":
+        locus = st.text_input("Locus coordinates, e.g. chr9:27545914-27573770", value="chr9:27545914-27573770")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            target_tile_size = st.number_input("Target tile size", min_value=1000, value=10000, step=500)
+        with c2:
+            min_tile_size = st.number_input("Min tile size", min_value=500, value=5000, step=500)
+        with c3:
+            max_tile_size = st.number_input("Max tile size", min_value=1000, value=12000, step=500)
+    else:
+        hotspot_targets_text = st.text_area(
+            "Target regions (either BED-like, e.g. chr9<TAB>108874893<TAB>108874894<TAB>other_fields, or genome browser-like, e.g. chr9:108874893-108874894)",
+            value=HOTSPOT_EXAMPLE,
+            height=180,
+        )
+        coord_label = st.radio(
+            "Coordinate system",
+            ["0-based half-open", "1-based inclusive"],
+            horizontal=True,
+            index=0,
+        )
+        hotspot_coordinate_system = "0based" if coord_label.startswith("0-based") else "1based"
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            target_tile_size = st.number_input("Target tile size", min_value=1000, value=10000, step=500)
+        with c2:
+            max_tile_size = st.number_input("Max tile size", min_value=1000, value=12000, step=500)
+        with c3:
+            min_tile_gap_bp = st.number_input("Minimum tile gap", min_value=0, value=500, step=100)
+        min_tile_size = 500
+
     submitted = st.form_submit_button("Design guides", use_container_width=True)
 
 if "last_result" not in st.session_state:
@@ -611,17 +876,21 @@ if submitted:
         ensure_path(str(scripts_dir), "dir")
         out_root.mkdir(parents=True, exist_ok=True)
 
-        normalized_locus = validate_locus_syntax(locus)
+        normalized_locus = validate_locus_syntax(locus) if design_mode == "multi_tile" and locus else None
 
         result = run_pipeline(
             repo_root=repo_root,
             scripts_dir=scripts_dir,
             out_root=out_root,
+            design_mode=design_mode,
             locus=normalized_locus,
             target_tile_size=int(target_tile_size),
             min_tile_size=int(min_tile_size),
             max_tile_size=int(max_tile_size),
-            force_single_tile=bool(force_single_tile),
+            force_single_tile=False,
+            hotspot_targets_text=hotspot_targets_text,
+            hotspot_coordinate_system=hotspot_coordinate_system,
+            min_tile_gap_bp=int(min_tile_gap_bp),
             progress_placeholder=progress_placeholder
         )
         st.session_state["last_result"] = result

@@ -26,6 +26,8 @@ def classify_design(row: pd.Series) -> str:
         return 'unacceptable'
     if bool(row.get('has_exact_in_locus_offtarget', False)):
         return 'unacceptable'
+    if bool(row.get('guide_too_close_to_target', False)):
+        return 'unacceptable'
     if row['ontarget_score'] >= 55 and row['offtarget_score'] >= 70 and not bool(row['basic_sequence_warning']):
         return 'ideal'
     if row['ontarget_score'] >= 30 and row['offtarget_score'] >= 50:
@@ -39,6 +41,7 @@ def rank_score(row: pd.Series) -> float:
     score += 0.50 * float(row['offtarget_score'])
     score -= 80.0 * float(row['n_common_snp_overlaps'])
     score -= 150.0 * float(bool(row.get('has_exact_in_locus_offtarget', False)))
+    score -= 150.0 * float(bool(row.get('guide_too_close_to_target', False)))
     if bool(row['basic_sequence_warning']):
         score -= 8.0
     if bool(row['has_homopolymer']):
@@ -89,6 +92,16 @@ def main() -> int:
         df['exact_in_locus_offtarget_sites'] = ''
     else:
         df['exact_in_locus_offtarget_sites'] = df['exact_in_locus_offtarget_sites'].fillna('')
+    if 'guide_too_close_to_target' not in df.columns:
+        df['guide_too_close_to_target'] = False
+    else:
+        df['guide_too_close_to_target'] = df['guide_too_close_to_target'].fillna(False).astype(bool)
+    if 'nearest_target_distance_bp' not in df.columns:
+        df['nearest_target_distance_bp'] = pd.NA
+    if 'nearest_target_id' not in df.columns:
+        df['nearest_target_id'] = ''
+    if 'nearest_target_label' not in df.columns:
+        df['nearest_target_label'] = ''
 
     df['final_rank_score'] = df.apply(rank_score, axis=1)
     df['design_class'] = df.apply(classify_design, axis=1)
