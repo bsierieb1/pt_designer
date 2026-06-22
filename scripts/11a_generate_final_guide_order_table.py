@@ -51,6 +51,15 @@ def write_fasta(df: pd.DataFrame, path: Path) -> None:
             handle.write(seq + "\n")
 
 
+def export_table(df: pd.DataFrame) -> pd.DataFrame:
+    return df.rename(
+        columns={
+            "on_target_score": "on_target_score (Doench2016/Moreno-Mateos2015 percentile)",
+            "off_target_score": "off_target_score (MIT Specificity score)",
+        }
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate final guide ordering table.")
     ap.add_argument("--selected-pairs-final-tsv", required=True)
@@ -118,7 +127,7 @@ def main() -> int:
             })
 
     out = pd.DataFrame(rows)
-    out.to_csv(outdir / "guides_for_ordering.csv", index=False)
+    export_table(out).to_csv(outdir / "guides_for_ordering.csv", index=False)
     if use_pools:
         write_fasta(out[out["pool"] == "odd"], outdir / "guides_odd.fasta")
         write_fasta(out[out["pool"] == "even"], outdir / "guides_even.fasta")

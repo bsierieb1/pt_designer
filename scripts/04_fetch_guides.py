@@ -18,8 +18,8 @@ import pandas as pd
 
 UCSC_API = "https://api.genome.ucsc.edu"
 MIT_RE = re.compile(r"MIT[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
-DOENCH_RE = re.compile(r"Doench[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)%", re.IGNORECASE)
-MORENO_RE = re.compile(r"Moreno[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)%", re.IGNORECASE)
+DOENCH_RE = re.compile(r"Doench(?:\s*2016)?[^0-9%]{0,40}([0-9]+(?:\.[0-9]+)?)%", re.IGNORECASE)
+MORENO_RE = re.compile(r"Moreno(?:[- ]Mateos)?(?:\s*2015)?[^0-9%]{0,40}([0-9]+(?:\.[0-9]+)?)%", re.IGNORECASE)
 BAE_RE = re.compile(r"out[- ]of[- ]frame[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 
 

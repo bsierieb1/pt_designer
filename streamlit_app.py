@@ -752,8 +752,8 @@ def show_result(result: RunResult):
                 "Sequence",
                 "Strand",
                 "Cut site",
-                "On-target score",
-                "Off-target score",
+                "On-target score (Doench2016/Moreno-Mateos2015 percentile)",
+                "Off-target score (MIT Specificity score)",
             ]
         else:
             expected_cols = [
@@ -765,8 +765,8 @@ def show_result(result: RunResult):
                 "Sequence",
                 "Strand",
                 "Cut site",
-                "On-target score",
-                "Off-target score",
+                "On-target score (Doench2016/Moreno-Mateos2015 percentile)",
+                "Off-target score (MIT Specificity score)",
             ]
         if len(guide_df.columns) == len(expected_cols):
             guide_df.columns = expected_cols
