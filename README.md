@@ -43,6 +43,8 @@ Hotspot mode currently requires all target regions to be on one chromosome. If y
 
 The hotspot planner tries to cover all submitted target regions with the smallest number of non-overlapping tiles. Each tile must be no larger than `Max tile size`; neighboring tiles must be at least the requested minimum gap apart, which defaults to 500 bp. The full tile set is evaluated together, because a better redesign for one tile can change which targets another tile should cover.
 
+After the best hotspot plan is selected, the optimizer runs a local repair pass for weak selected tiles. By default, a tile with a selected pair score below `-200` is treated as weak. The repair pass first tries shifting only that tile, then tries a small adjacent block around it, while keeping target coverage, max tile size, no-overlap, minimum-gap, and guide-to-target-distance constraints intact. A repair is accepted only if the complete plan score improves; otherwise the original best plan is kept.
+
 Hotspot guide selection also enforces a target-protection rule: each guide plus PAM footprint must be at least 50 bp away from any submitted target region. Guides that violate this rule are marked unacceptable and are not used for hotspot guide pairs.
 
 Outputs:
